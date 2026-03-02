@@ -522,14 +522,13 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
 
     async def _write_audio_sleep(self):
         """Simulate audio playback timing with appropriate delays."""
-        # Simulate a clock.
         current_time = time.monotonic()
+        if self._next_send_time == 0:
+            self._next_send_time = current_time
         sleep_duration = max(0, self._next_send_time - current_time)
-        await asyncio.sleep(sleep_duration)
-        if sleep_duration == 0:
-            self._next_send_time = time.monotonic() + self._send_interval
-        else:
-            self._next_send_time += self._send_interval
+        if sleep_duration > 0:
+            await asyncio.sleep(sleep_duration)
+        self._next_send_time += self._send_interval
 
 
 class FastAPIWebsocketTransport(BaseTransport):
