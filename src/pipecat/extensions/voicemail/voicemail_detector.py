@@ -16,6 +16,7 @@ Note:
 """
 
 import asyncio
+import time
 from typing import List, Optional
 
 from loguru import logger
@@ -236,6 +237,7 @@ class ClassificationProcessor(FrameProcessor):
         conversation_notifier: BaseNotifier,
         voicemail_notifier: BaseNotifier,
         voicemail_response_delay: float,
+        classification_start_delay: float = 0.0,
     ):
         """Initialize the voicemail processor.
 
@@ -255,6 +257,8 @@ class ClassificationProcessor(FrameProcessor):
         self._conversation_notifier = conversation_notifier
         self._voicemail_notifier = voicemail_notifier
         self._voicemail_response_delay = voicemail_response_delay
+        self._classification_start_delay = classification_start_delay
+        self._start_time: Optional[float] = None
 
         # Register the conversation and voicemail detected events
         self._register_event_handler("on_conversation_detected")
@@ -278,6 +282,7 @@ class ClassificationProcessor(FrameProcessor):
             setup: Configuration object containing setup parameters.
         """
         await super().setup(setup)
+        self._start_time = time.monotonic()
         self._voicemail_task = self.create_task(self._delayed_voicemail_handler())
 
     async def cleanup(self):
@@ -347,6 +352,15 @@ class ClassificationProcessor(FrameProcessor):
         """
         if self._decision_made:
             return
+
+        if self._start_time is not None and self._classification_start_delay > 0:
+            elapsed = time.monotonic() - self._start_time
+            if elapsed < self._classification_start_delay:
+                logger.debug(
+                    f"{self}: Skipping early classification at {elapsed:.1f}s "
+                    f"(delay={self._classification_start_delay}s): '{full_response}'"
+                )
+                return
 
         response = full_response.upper()
         logger.debug(f"{self}: Classifying response: '{full_response}'")
@@ -591,6 +605,7 @@ VOICEMAIL SYSTEM (respond "VOICEMAIL"):
         *,
         llm: LLMService,
         voicemail_response_delay: float = 2.0,
+        classification_start_delay: float = 0.0,
         custom_system_prompt: Optional[str] = None,
     ):
         """Initialize the voicemail detector with classification and buffering components.
@@ -612,6 +627,7 @@ VOICEMAIL SYSTEM (respond "VOICEMAIL"):
             custom_system_prompt if custom_system_prompt is not None else self.DEFAULT_SYSTEM_PROMPT
         )
         self._voicemail_response_delay = voicemail_response_delay
+        self._classification_start_delay = classification_start_delay
 
         # Validate custom prompts to ensure they work with the detection logic
         if custom_system_prompt is not None:
@@ -645,6 +661,7 @@ VOICEMAIL SYSTEM (respond "VOICEMAIL"):
             conversation_notifier=self._conversation_notifier,
             voicemail_notifier=self._voicemail_notifier,
             voicemail_response_delay=voicemail_response_delay,
+            classification_start_delay=classification_start_delay,
         )
         self._voicemail_gate = TTSGate(self._conversation_notifier, self._voicemail_notifier)
 
