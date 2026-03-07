@@ -25,6 +25,8 @@ from pipecat.frames.frames import (
     Frame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMMessagesAppendFrame,
+    LLMRunFrame,
     LLMTextFrame,
     StopFrame,
     SystemFrame,
@@ -169,6 +171,15 @@ class ClassifierGate(NotifierGate):
             direction: The direction of frame flow in the pipeline.
         """
         await FrameProcessor.process_frame(self, frame, direction)
+
+        # Block main pipeline LLM frames from reaching the classifier LLM.
+        # LLMRunFrame/LLMMessagesAppendFrame originate from the main bot pipeline and
+        # LLMRunFrame is used to run the LLM for the welcome message dynamically
+        #  and LLMMessagesAppendFrame is used to append the messages to the context.
+        # would cause the classifier to run with the bot's own context instead of
+        # only the callee's transcription.
+        if isinstance(frame, (LLMRunFrame, LLMMessagesAppendFrame)):
+            return
 
         # Gate logic: open gate allows all frames, closed gate filters frames
         if self._gate_opened:
