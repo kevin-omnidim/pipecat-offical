@@ -34,11 +34,13 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
     TTSTextFrame,
+    TranscriptionFrame,
+    BotStoppedSpeakingFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.parallel_pipeline import ParallelPipeline
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext, LLMContextMessage
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
@@ -146,6 +148,7 @@ class ClassifierGate(NotifierGate):
         self._conversation_notifier = conversation_notifier
         self._conversation_detected = False
         self._conversation_task: Optional[asyncio.Task] = None
+        self._first_bot_sentence_completed = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the processor with required components.
@@ -181,6 +184,17 @@ class ClassifierGate(NotifierGate):
         if isinstance(frame, (LLMRunFrame, LLMMessagesAppendFrame)):
             return
 
+        # Stop auto-running classification once the bot completes its first sentence.
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            self._first_bot_sentence_completed = True
+
+        # While the bot is still delivering its first sentence, feed all transcriptions
+        # to the classifier branch to decide CONVERSATION vs VOICEMAIL quickly.
+        if isinstance(frame, TranscriptionFrame) and not self._first_bot_sentence_completed:
+            await self.push_frame(LLMMessagesAppendFrame(messages=[{"role": "user", "content": frame.text}]))
+            await self.push_frame(LLMRunFrame())
+            logger.info(f"::: LLM RUN FRAME :::  {frame.text} self._gate_opened={self._gate_opened}")
+        
         # Gate logic: open gate allows all frames, closed gate filters frames
         if self._gate_opened:
             await self.push_frame(frame, direction)
@@ -629,7 +643,7 @@ VOICEMAIL SYSTEM (respond "VOICEMAIL"):
             self._validate_prompt(custom_system_prompt)
 
         # Set up the LLM context with the classification prompt
-        self._messages = [
+        self._messages: List[LLMContextMessage] = [
             {
                 "role": "system",
                 "content": self._prompt,
