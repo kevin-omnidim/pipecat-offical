@@ -147,8 +147,7 @@ class FastAPIWebsocketClient:
                 if isinstance(data, bytes):
                     await self._websocket.send_bytes(data)
                 else:
-                    if data and data.get('label', '') != 'rtvi-ai':
-                        await self._websocket.send_text(data)
+                    await self._websocket.send_text(data)
         except Exception as e:
             # For some reason the websocket is disconnected, and we are not able to send data
             # So let's properly handle it and disconnect the transport if it is not already disconnecting
@@ -450,7 +449,8 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         Args:
             frame: The transport message frame to send.
         """
-        await self._write_frame(frame)
+        if frame.message.get('label') != 'rtvi-ai': 
+            await self._write_frame(frame)
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         """Write an audio frame to the WebSocket with timing simulation.
