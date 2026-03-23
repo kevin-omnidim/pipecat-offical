@@ -147,7 +147,8 @@ class FastAPIWebsocketClient:
                 if isinstance(data, bytes):
                     await self._websocket.send_bytes(data)
                 else:
-                    await self._websocket.send_text(data)
+                    if data and data.get('label', '') != 'rtvi-ai':
+                        await self._websocket.send_text(data)
         except Exception as e:
             # For some reason the websocket is disconnected, and we are not able to send data
             # So let's properly handle it and disconnect the transport if it is not already disconnecting
