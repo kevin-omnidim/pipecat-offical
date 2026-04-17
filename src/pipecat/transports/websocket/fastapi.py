@@ -173,7 +173,9 @@ class FastAPIWebsocketClient:
         if self.is_connected and not self.is_closing:
             self._closing = True
             try:
-                await self._websocket.close()
+                await asyncio.wait_for(self._websocket.close(), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"{self} websocket close timed out, peer already disconnected")
             except Exception as e:
                 logger.error(f"{self} exception while closing the websocket: {e}")
 
