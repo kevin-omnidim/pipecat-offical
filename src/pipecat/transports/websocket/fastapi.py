@@ -180,9 +180,19 @@ class FastAPIWebsocketClient:
                 else:
                     await self._websocket.send_text(data)
         except Exception as e:
-            logger.warning(
-                f"{self} exception sending data: {e.__class__.__name__} ({e}), application_state: {self._websocket.application_state}"
-            )
+            # If the websocket is already disconnected, proactively disconnect the
+            # transport so we don't keep retrying sends that will never land.
+            if (
+                self._websocket.application_state == WebSocketState.DISCONNECTED
+                and not self.is_closing
+            ):
+                logger.warning(f"{self} closing already-disconnected websocket")
+                self._closing = True
+                await self.trigger_client_disconnected()
+            else:
+                logger.warning(
+                    f"{self} exception sending data: {e.__class__.__name__} ({e}), application_state: {self._websocket.application_state}"
+                )
 
     async def disconnect(self):
         """Disconnect the WebSocket client.
@@ -514,6 +524,11 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         Args:
             frame: The transport message frame to send.
         """
+        # 'rtvi-ai'-labeled messages are internal RTVI bus traffic and must not
+        # leak over the telephony WebSocket — providers like Twilio/Exotel will
+        # reject or log them as protocol violations.
+        if isinstance(frame.message, dict) and frame.message.get("label") == "rtvi-ai":
+            return
         await self._write_frame(frame)
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:

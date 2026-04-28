@@ -20,13 +20,17 @@ import asyncio
 from loguru import logger
 
 from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
     EndFrame,
     Frame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMMessagesAppendFrame,
+    LLMRunFrame,
     LLMTextFrame,
     StopFrame,
     SystemFrame,
+    TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -143,6 +147,7 @@ class ClassifierGate(NotifierGate):
         self._conversation_notifier = conversation_notifier
         self._conversation_detected = False
         self._conversation_task: asyncio.Task | None = None
+        self._first_bot_sentence_completed = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the processor with required components.
@@ -168,6 +173,35 @@ class ClassifierGate(NotifierGate):
             direction: The direction of frame flow in the pipeline.
         """
         await FrameProcessor.process_frame(self, frame, direction)
+
+        # Block main-pipeline LLM control frames from leaking into the classifier
+        # branch. LLMRunFrame is used by the main bot to dynamically run its LLM
+        # (e.g. for the welcome message); LLMMessagesAppendFrame appends to the
+        # main context. If either reaches the classifier, it would run with the
+        # bot's own context instead of just the callee's transcription.
+        if isinstance(frame, (LLMRunFrame, LLMMessagesAppendFrame)):
+            return
+
+        # Stop the early-classification fast path once the bot finishes its
+        # first sentence — by then we've had enough time to hear the callee
+        # respond naturally and the classifier branch can rely on the normal
+        # transcription flow.
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            self._first_bot_sentence_completed = True
+
+        # Early-detection fast path: while the bot is still speaking its first
+        # sentence, feed every transcription straight into the classifier LLM
+        # so we can decide CONVERSATION vs VOICEMAIL as quickly as possible.
+        if (
+            isinstance(frame, TranscriptionFrame)
+            and not self._first_bot_sentence_completed
+        ):
+            await self.push_frame(
+                LLMMessagesAppendFrame(
+                    messages=[{"role": "user", "content": frame.text}]
+                )
+            )
+            await self.push_frame(LLMRunFrame())
 
         # Gate logic: open gate allows all frames, closed gate filters frames
         if self._gate_opened:
