@@ -15,11 +15,16 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.turns.types import ProcessFrameResult
 from pipecat.turns.user_start import VADUserTurnStartStrategy
 from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
     MinWordsUserTurnStartStrategy,
 )
-from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy, deferred
+from pipecat.turns.user_stop import (
+    BaseUserTurnStopStrategy,
+    SpeechTimeoutUserTurnStopStrategy,
+    deferred,
+)
 from pipecat.turns.user_turn_controller import UserTurnController
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies, UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
@@ -330,3 +335,103 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _VADGatedStopStrategy(BaseUserTurnStopStrategy):
+    """Minimal stand-in for the production stop-strategy family
+    (TurnAnalyzer-led): the turn stop can ONLY be committed off VAD
+    evidence. A turn opened without any VAD activity behind it gives
+    this strategy nothing to react to — exactly the production
+    configuration in the 2026-06-03 deadlock.
+    """
+
+    async def reset(self):
+        pass
+
+    async def process_frame(self, frame):
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
+            await self.trigger_user_turn_inference_triggered()
+            await self.trigger_user_turn_stopped()
+            return ProcessFrameResult.STOP
+        return ProcessFrameResult.CONTINUE
+
+
+class TestUserTurnDeadlock(unittest.IsolatedAsyncioTestCase):
+    """Regression for the 2026-06-03 turn-deadlock (call 1780458849.5219):
+    a late final transcript re-opened the user turn via a transcription
+    start strategy (MinWords drops to 1 word when the bot isn't
+    speaking), the aggregator's synthetic UserStartedSpeakingFrame
+    echoed back into the controller and set ``_user_speaking``
+    stale-true, and the stop-timeout watchdog — guarded by
+    ``not _user_speaking`` — never fired. With VAD-gated stop
+    strategies (production: TurnAnalyzer-led) no strategy can close a
+    turn that has no VAD activity behind it, so the conversation
+    starved until the caller re-prompted ("Hello, are you here?") 24
+    seconds later.
+
+    With standard (VAD/transcription) strategies the synthetic
+    UserStarted/StoppedSpeakingFrames are the controller's own turn
+    byproducts, not speech evidence — only VAD frames are. External
+    strategies (where those frames ARE the authoritative signal) keep
+    the existing behavior, pinned by
+    ``test_external_user_turn_strategies_no_timeout_while_speaking``.
+    """
+
+    async def asyncSetUp(self):
+        self.task_manager = TaskManager()
+        self.task_manager.setup(TaskManagerParams(loop=asyncio.get_running_loop()))
+
+    def _make_controller(self):
+        return UserTurnController(
+            user_turn_strategies=UserTurnStrategies(
+                start=[MinWordsUserTurnStartStrategy(min_words=3)],
+                stop=[_VADGatedStopStrategy()],
+            ),
+            user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT,
+        )
+
+    async def test_phantom_turn_start_echo_cannot_defeat_stop_timeout(self):
+        controller = self._make_controller()
+        await controller.setup(self.task_manager)
+
+        stops = []
+        timeouts = []
+
+        @controller.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(controller, strategy, params):
+            stops.append(strategy)
+
+        @controller.event_handler("on_user_turn_stop_timeout")
+        async def on_user_turn_stop_timeout(controller):
+            timeouts.append(True)
+
+        # The genuine turn: VAD start, transcript, VAD stop — the
+        # VAD-gated strategy closes it.
+        await controller.process_frame(VADUserStartedSpeakingFrame())
+        await controller.process_frame(
+            TranscriptionFrame(text="okay let's finalize", user_id="", timestamp="")
+        )
+        await controller.process_frame(VADUserStoppedSpeakingFrame())
+        self.assertEqual(len(stops), 1, "the genuine turn should close")
+
+        # The phantom: a LATE final token re-opens the turn (MinWords
+        # threshold is 1 while the bot isn't speaking)…
+        await controller.process_frame(
+            TranscriptionFrame(text="finalize", user_id="", timestamp="")
+        )
+        self.assertTrue(controller._user_turn, "phantom start should open the turn")
+        # …and the aggregator's synthetic broadcast echoes back into the
+        # controller. The user is silent; no VAD frame accompanies it,
+        # so the VAD-gated stop strategy can never fire.
+        await controller.process_frame(UserStartedSpeakingFrame())
+
+        # Nothing else ever arrives. The watchdog is the only way out.
+        await asyncio.sleep(USER_TURN_STOP_TIMEOUT + 0.15)
+        self.assertTrue(
+            timeouts,
+            "stop-timeout watchdog must fire for a stuck-open turn even "
+            "when the synthetic UserStartedSpeakingFrame echo set "
+            "_user_speaking stale-true",
+        )
+        self.assertEqual(len(stops), 2, "the stuck turn must be force-stopped")
+        self.assertFalse(controller._user_turn, "turn must be closed")

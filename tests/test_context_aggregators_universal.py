@@ -58,12 +58,19 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.tests.utils import SleepFrame, run_test
+from pipecat.turns.types import ProcessFrameResult
 from pipecat.turns.user_mute import (
     FirstSpeechUserMuteStrategy,
     FunctionCallUserMuteStrategy,
     MuteUntilFirstBotCompleteUserMuteStrategy,
 )
-from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
+    MinWordsUserTurnStartStrategy,
+)
+from pipecat.turns.user_stop import (
+    BaseUserTurnStopStrategy,
+    SpeechTimeoutUserTurnStopStrategy,
+)
 from pipecat.turns.user_turn_strategies import (
     FilterIncompleteUserTurnStrategies,
     UserTurnStrategies,
@@ -1653,3 +1660,128 @@ class TestToolChangeMessages(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _VADGatedStopStrategyForDeadlock(BaseUserTurnStopStrategy):
+    """Stand-in for the production VAD-gated stop family (TurnAnalyzer-led):
+    the stop can only be committed off VAD evidence, so a turn opened with
+    no VAD activity behind it (the 2026-06-03 phantom-start deadlock) can
+    only be recovered by the stop-timeout watchdog.
+    """
+
+    async def reset(self):
+        pass
+
+    async def process_frame(self, frame):
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
+            await self.trigger_user_turn_inference_triggered()
+            await self.trigger_user_turn_stopped()
+            return ProcessFrameResult.STOP
+        return ProcessFrameResult.CONTINUE
+
+
+class UserTurnForcedStopMustSpeakTests(unittest.IsolatedAsyncioTestCase):
+    """The watchdog's forced stop must leave the conversation alive:
+    non-empty aggregation kicks inference (the bot answers what the
+    phantom turn swallowed); empty aggregation closes the turn cleanly.
+    Companion to TestUserTurnDeadlock in test_user_turn_controller.py.
+    """
+
+    def _make_aggregator(self, context):
+        return LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[MinWordsUserTurnStartStrategy(min_words=3)],
+                    stop=[_VADGatedStopStrategyForDeadlock()],
+                ),
+                user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT,
+            ),
+        )
+
+    async def test_forced_stop_with_content_runs_inference(self):
+        context = LLMContext()
+        user_aggregator = self._make_aggregator(context)
+
+        timeout = None
+        stop_messages = []
+
+        @user_aggregator.event_handler("on_user_turn_stop_timeout")
+        async def on_user_turn_stop_timeout(aggregator):
+            nonlocal timeout
+            timeout = True
+
+        @user_aggregator.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(aggregator, strategy, message):
+            stop_messages.append(message)
+
+        frames_to_send = [
+            # Genuine turn: closes via the VAD-gated strategy, runs LLM.
+            VADUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="okay let's finalize", user_id="", timestamp="now"),
+            # Real calls have inter-frame pacing; without it the turn-start
+            # event task races the stop strategy's trigger.
+            SleepFrame(sleep=0.05),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.05),
+            # The phantom: a late 1-word final re-opens the turn (MinWords
+            # threshold drops to 1 — bot not speaking) and aggregates.
+            TranscriptionFrame(text="finalize", user_id="", timestamp="now"),
+            # The synthetic speaking echo arrives from the parallel branch.
+            UserStartedSpeakingFrame(),
+            # Silence. Only the watchdog can recover the turn.
+            SleepFrame(sleep=USER_TURN_STOP_TIMEOUT + 0.15),
+        ]
+        received_down, _ = await run_test(
+            Pipeline([user_aggregator]),
+            frames_to_send=frames_to_send,
+        )
+
+        self.assertTrue(timeout, "watchdog must fire for the stuck turn")
+        context_runs = [f for f in received_down if isinstance(f, LLMContextFrame)]
+        self.assertEqual(
+            len(context_runs),
+            2,
+            "forced stop with aggregated content must kick inference "
+            "(the bot answers what the phantom turn swallowed)",
+        )
+        self.assertEqual(len(stop_messages), 2)
+        self.assertEqual(stop_messages[1].content, "finalize")
+
+    async def test_forced_stop_with_empty_aggregation_closes_cleanly(self):
+        context = LLMContext()
+        user_aggregator = self._make_aggregator(context)
+
+        timeout = None
+
+        @user_aggregator.event_handler("on_user_turn_stop_timeout")
+        async def on_user_turn_stop_timeout(aggregator):
+            nonlocal timeout
+            timeout = True
+
+        frames_to_send = [
+            VADUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="okay let's finalize", user_id="", timestamp="now"),
+            # Real calls have inter-frame pacing; without it the turn-start
+            # event task races the stop strategy's trigger.
+            SleepFrame(sleep=0.05),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.05),
+            # Phantom opened by an INTERIM (triggers MinWords, but interims
+            # do not aggregate): the stuck turn has no content.
+            InterimTranscriptionFrame(text="hm", user_id="", timestamp="now"),
+            UserStartedSpeakingFrame(),
+            SleepFrame(sleep=USER_TURN_STOP_TIMEOUT + 0.15),
+        ]
+        received_down, _ = await run_test(
+            Pipeline([user_aggregator]),
+            frames_to_send=frames_to_send,
+        )
+
+        self.assertTrue(timeout, "watchdog must fire for the stuck turn")
+        context_runs = [f for f in received_down if isinstance(f, LLMContextFrame)]
+        self.assertEqual(
+            len(context_runs),
+            1,
+            "empty forced stop must not kick a content-less inference",
+        )
