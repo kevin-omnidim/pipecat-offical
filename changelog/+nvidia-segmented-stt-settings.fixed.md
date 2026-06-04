@@ -1,0 +1,1 @@
+Fixed `NvidiaSegmentedSTTService` failing settings-completeness validation: its default settings omitted `speaker_diarization` and `diarization_max_speakers` (inherited from the shared NVIDIA settings base), leaving them `NOT_GIVEN` after construction. Defaults now mirror `NvidiaSTTService` (`False` / `0`).
