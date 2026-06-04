@@ -123,6 +123,15 @@ class FrameProcessorMetrics(BaseObject):
         self._start_ttfb_time = 0
         return MetricsFrame(data=[ttfb])
 
+    async def cancel_ttfb_metrics(self):
+        """Discard an in-progress TTFB measurement without reporting it.
+
+        Used when the awaited first byte is known to never arrive (e.g. an
+        STT utterance that produced no transcript), so the armed start time
+        cannot leak into a later measurement.
+        """
+        self._start_ttfb_time = 0
+
     async def start_processing_metrics(self, *, start_time: float | None = None):
         """Start measuring processing time.
 

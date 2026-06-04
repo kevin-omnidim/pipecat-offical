@@ -446,6 +446,11 @@ class FrameProcessor(BaseObject):
             if frame:
                 await self.push_frame(frame)
 
+    async def cancel_ttfb_metrics(self):
+        """Discard an in-progress TTFB measurement without reporting it."""
+        if self.can_generate_metrics() and self.metrics_enabled:
+            await self._metrics.cancel_ttfb_metrics()
+
     async def start_processing_metrics(self, *, start_time: float | None = None):
         """Start processing metrics collection.
 

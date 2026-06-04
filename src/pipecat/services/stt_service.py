@@ -98,8 +98,12 @@ class STTService(AIService):
                 Defaults to True.
             sample_rate: The sample rate for audio input. If None, will be determined
                 from the start frame.
-            stt_ttfb_timeout: Time in seconds to wait after VAD stop before reporting
-                TTFB. This delay allows the final transcription to arrive. Defaults to 2.0.
+            stt_ttfb_timeout: Floor (in seconds) of the no-show window — how long to
+                wait after VAD stop before reporting TTFB. This delay allows the final
+                transcription to arrive. The effective window is
+                ``max(stt_ttfb_timeout, ttfs_p99_latency * 1.5)`` (see
+                :attr:`stt_ttfb_no_show_window`) so providers with slow finals are not
+                cut off mid-flight. Defaults to 2.0.
                 Note: STT "TTFB" differs from traditional TTFB (which measures from a discrete
                 request to first response byte). Since STT receives continuous audio, we measure
                 from when the user stops speaking to when the final transcript arrives—capturing
@@ -471,6 +475,19 @@ class STTService(AIService):
         await super().push_frame(frame, direction)
 
     @property
+    def stt_ttfb_no_show_window(self) -> float:
+        """Seconds to wait after speech end before declaring a TTFB no-show.
+
+        Derived per provider as ``max(stt_ttfb_timeout, ttfs_p99_latency * 1.5)``
+        so slow-but-real finals (e.g. a provider whose p99 approaches the flat
+        timeout) are never discarded while still in flight. Falls back to
+        ``stt_ttfb_timeout`` when no p99 is configured.
+        """
+        if self._ttfs_p99_latency:
+            return max(self._stt_ttfb_timeout, self._ttfs_p99_latency * 1.5)
+        return self._stt_ttfb_timeout
+
+    @property
     def supports_ttfs(self) -> bool:
         """Whether this STT service has a meaningful TTFS-to-final-transcript metric.
 
@@ -512,6 +529,10 @@ class STTService(AIService):
         while user is still speaking.
         """
         await self._cancel_ttfb_timeout()
+        # Disarm any leftover TTFB clock as well: a measurement armed by a
+        # previous utterance must never be stopped by a later utterance's
+        # transcript (that misread produces multi-second phantom TTFBs).
+        await self.cancel_ttfb_metrics()
 
     async def _handle_vad_user_started_speaking(self, frame: VADUserStartedSpeakingFrame):
         """Handle VAD user started speaking frame to start tracking transcriptions.
@@ -576,12 +597,16 @@ class STTService(AIService):
         This timeout allows the final transcription to arrive before we calculate
         and report TTFB. Uses _last_transcript_time as the end time so we measure
         to when the transcript actually arrived, not when the timeout fired.
-        If no transcription arrived, no TTFB is reported.
+        If no transcription arrived, the armed measurement is discarded — the
+        utterance was a no-show (e.g. a VAD false-start) and its clock must not
+        survive to be stopped by a later utterance's transcript.
         """
         try:
-            await asyncio.sleep(self._stt_ttfb_timeout)
+            await asyncio.sleep(self.stt_ttfb_no_show_window)
             if self._last_transcript_time > 0:
                 await self.stop_ttfb_metrics(end_time=self._last_transcript_time)
+            else:
+                await self.cancel_ttfb_metrics()
         except asyncio.CancelledError:
             # Task was cancelled (new utterance or interruption), which is expected behavior
             pass
