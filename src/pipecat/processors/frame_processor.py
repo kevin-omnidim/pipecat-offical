@@ -445,6 +445,11 @@ class FrameProcessor(BaseObject):
             if frame:
                 await self.push_frame(frame)
 
+    async def cancel_ttfb_metrics(self):
+        """Discard an in-progress TTFB measurement without reporting it."""
+        if self.can_generate_metrics() and self.metrics_enabled:
+            await self._metrics.cancel_ttfb_metrics()
+
     async def process_ttfa_metrics(self, frame: TTSAudioRawFrame):
         """Scan a TTS audio frame for the first audible sample and push TTFA.
 
