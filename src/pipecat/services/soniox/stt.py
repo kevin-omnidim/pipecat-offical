@@ -506,9 +506,15 @@ class SonioxSTTService(WebsocketSTTService):
                 await self.push_error(error_msg=f"Unable to connect to Soniox API at {self._url}")
                 raise Exception(f"Unable to connect to Soniox API at {self._url}")
 
-            # If vad_force_turn_endpoint is not enabled, we need to enable endpoint detection.
-            # Either one or the other is required.
-            enable_endpoint_detection = not self._vad_force_turn_endpoint
+            # Endpoint detection is always on, even with vad_force_turn_endpoint:
+            # Soniox then emits <end> tokens from its own server-side silence
+            # detection, so committed tokens still flush when the pipeline VAD
+            # never fires a stop (e.g. soft speech under bot audio, where VAD
+            # runs with raised thresholds). The VAD finalize message remains a
+            # faster path when it does fire. Running both is safe: a flush
+            # empties the buffer and send_endpoint_transcript() is a no-op on
+            # an empty buffer, so the second <end>/<fin> cannot double-emit.
+            enable_endpoint_detection = True
 
             s = self._settings
 
@@ -532,6 +538,10 @@ class SonioxSTTService(WebsocketSTTService):
                 "enable_language_identification": s.enable_language_identification,
                 "client_reference_id": s.client_reference_id,
             }
+            logger.debug(
+                "Soniox connect config: "
+                f"{ {k: v for k, v in config.items() if k != 'api_key'} }"
+            )
 
             # Send the configuration message.
             await self._websocket.send(json.dumps(config))
@@ -574,11 +584,22 @@ class SonioxSTTService(WebsocketSTTService):
         """
         # Transcription frame will be only sent after we get the "endpoint" event.
         self._final_transcription_buffer = []
+        # Last interim text pushed downstream. Soniox sends periodic messages
+        # even when no new tokens arrive, and re-pushing the unchanged buffer
+        # as a fresh interim every ~1s makes stale text look like continuous
+        # user activity downstream (re-triggers turn starts, starves the turn
+        # stop watchdog, resets the user-idle timer). Only push an interim
+        # when its text actually changed.
+        self._last_interim_text = None
 
         async def send_endpoint_transcript():
             if self._final_transcription_buffer:
                 text = "".join(map(lambda token: token["text"], self._final_transcription_buffer))
                 language = _language_from_tokens(self._final_transcription_buffer)
+                logger.debug(
+                    f"Soniox endpoint flush: {len(self._final_transcription_buffer)} tokens, "
+                    f"text={text[:80]!r}"
+                )
                 # Soniox only pushes TranscriptionFrame when an end token is received,
                 # so every TranscriptionFrame is inherently finalized
                 await self.push_frame(
@@ -594,6 +615,7 @@ class SonioxSTTService(WebsocketSTTService):
                 await self._handle_transcription(text, is_final=True, language=language)
                 await self.stop_processing_metrics()
                 self._final_transcription_buffer = []
+                self._last_interim_text = None
 
         async for message in self._get_websocket():
             try:
@@ -633,16 +655,19 @@ class SonioxSTTService(WebsocketSTTService):
                         map(lambda token: token["text"], non_final_transcription)
                     )
 
-                    await self.push_frame(
-                        InterimTranscriptionFrame(
-                            # Even final tokens are sent as interim tokens as we want to send
-                            # nicely formatted messages - therefore waiting for the endpoint.
-                            text=final_text + non_final_text,
-                            user_id=self._user_id,
-                            timestamp=time_now_iso8601(),
-                            result=self._final_transcription_buffer + non_final_transcription,
+                    interim_text = final_text + non_final_text
+                    if interim_text != self._last_interim_text:
+                        self._last_interim_text = interim_text
+                        await self.push_frame(
+                            InterimTranscriptionFrame(
+                                # Even final tokens are sent as interim tokens as we want to send
+                                # nicely formatted messages - therefore waiting for the endpoint.
+                                text=interim_text,
+                                user_id=self._user_id,
+                                timestamp=time_now_iso8601(),
+                                result=self._final_transcription_buffer + non_final_transcription,
+                            )
                         )
-                    )
 
                 error_code = content.get("error_code")
                 error_message = content.get("error_message")
