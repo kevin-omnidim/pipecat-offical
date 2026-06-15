@@ -99,7 +99,7 @@ class SonioxInputParams(BaseModel):
         client_reference_id: Client reference ID to use for transcription.
     """
 
-    model: str = "stt-rt-v4"
+    model: str = "stt-rt-v5"
 
     audio_format: str | None = "pcm_s16le"
     num_channels: int | None = 1
@@ -235,6 +235,7 @@ class SonioxSTTSettings(STTSettings):
         max_non_final_tokens_duration_ms: Max ms a token may stay non-final before Soniox
             forces it final (360-6000, server default 4000 region — bounds verified live
             2026-08-20). Lower = earlier finals at a small accuracy cost.
+        endpoint_sensitivity: Endpoint detection sensitivity (-1.0 to 1.0); higher finalizes sooner.
         client_reference_id: Client reference ID to use for transcription.
     """
 
@@ -249,6 +250,7 @@ class SonioxSTTSettings(STTSettings):
     max_non_final_tokens_duration_ms: int | None | _NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
+    endpoint_sensitivity: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     client_reference_id: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
@@ -309,7 +311,7 @@ class SonioxSTTService(WebsocketSTTService):
         """
         # --- 1. Hardcoded defaults ---
         default_settings = self.Settings(
-            model="stt-rt-v4",
+            model="stt-rt-v5",
             language=None,
             language_hints=None,
             language_hints_strict=None,
@@ -318,6 +320,7 @@ class SonioxSTTService(WebsocketSTTService):
             enable_language_identification=False,
             max_endpoint_delay_ms=None,
             max_non_final_tokens_duration_ms=None,
+            endpoint_sensitivity=None,
             client_reference_id=None,
         )
 
@@ -538,6 +541,7 @@ class SonioxSTTService(WebsocketSTTService):
                 "enable_endpoint_detection": enable_endpoint_detection,
                 "max_endpoint_delay_ms": s.max_endpoint_delay_ms,
                 "max_non_final_tokens_duration_ms": s.max_non_final_tokens_duration_ms,
+                "endpoint_sensitivity": s.endpoint_sensitivity,
                 "sample_rate": self.sample_rate,
                 "language_hints": _prepare_language_hints(assert_given(s.language_hints)),
                 "language_hints_strict": s.language_hints_strict,
