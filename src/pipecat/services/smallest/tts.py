@@ -6,19 +6,18 @@
 
 """Smallest AI text-to-speech service implementation.
 
-This module provides a WebSocket-based integration with Smallest AI's
-Waves API for real-time text-to-speech synthesis.
+This module provides a WebSocket-based integration with Smallest AI's Waves
+API for real-time text-to-speech synthesis.
 """
 
 import asyncio
 import base64
 import json
-from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from enum import StrEnum
-from typing import Any
+from typing import Any, AsyncGenerator, Dict, Optional
 
 from loguru import logger
+from pydantic import BaseModel
 
 from pipecat import version as pipecat_version
 from pipecat.frames.frames import (
@@ -28,10 +27,11 @@ from pipecat.frames.frames import (
     Frame,
     StartFrame,
     TTSAudioRawFrame,
+    TTSStartedFrame,
     TTSStoppedFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven
-from pipecat.services.tts_service import InterruptibleTTSService
+from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, is_given
+from pipecat.services.tts_service import AudioContextWordTTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.tracing.service_decorators import traced_tts
 
@@ -40,15 +40,18 @@ try:
     from websockets.protocol import State
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
-    logger.error("In order to use Smallest, you need to `pip install pipecat-ai[smallest]`.")
-    raise ImportError(f"Missing module: {e}") from e
+    logger.error("In order to use Smallest AI, you need to `pip install pipecat-ai[smallest]`.")
+    raise Exception(f"Missing module: {e}")
 
 
-class SmallestTTSModel(StrEnum):
-    """Available Smallest AI TTS models."""
+_MODEL_DEFAULT_VOICES: Dict[str, str] = {
+    "lightning_v3.1": "sophia",
+    "lightning_v3.1_pro": "meher",
+}
 
-    LIGHTNING_V2 = "lightning-v2"
-    LIGHTNING_V3_1 = "lightning-v3.1"
+# Voices that emit word-timestamp events on the base queue. Other voices
+# accept word_timestamps=True without error but simply emit no word events.
+_WORD_TIMESTAMP_VOICES = {"meher", "devansh", "kartik", "maithili", "liam", "avery"}
 
 
 def language_to_smallest_tts_language(language: Language) -> str:
@@ -58,10 +61,8 @@ def language_to_smallest_tts_language(language: Language) -> str:
         language: The Language enum value to convert.
 
     Returns:
-        The corresponding Smallest language code. If ``language`` is not in
-        the verified mapping, falls back to the base language code (e.g.,
-        ``en`` from ``en-US``) and logs a warning (via
-        ``resolve_language(..., use_base_code=True)``).
+        The corresponding Smallest language code, falling back to the base
+        code (e.g. ``en`` from ``en-US``) when not in the verified mapping.
     """
     LANGUAGE_MAP = {
         Language.AR: "ar",
@@ -90,189 +91,160 @@ class SmallestTTSSettings(TTSSettings):
     """Settings for SmallestTTSService.
 
     Parameters:
-        speed: Speech speed multiplier.
-        consistency: Consistency level for voice generation (0-1).
-        similarity: Similarity level for voice generation (0-1).
-        enhancement: Enhancement level for voice generation (0-2).
+        speed: Speech speed multiplier (0.5-2.0).
     """
 
     speed: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    consistency: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    similarity: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enhancement: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
-class SmallestTTSService(InterruptibleTTSService):
+class SmallestTTSService(AudioContextWordTTSService):
     """Smallest AI real-time text-to-speech service using WebSocket streaming.
 
-    Provides real-time text-to-speech synthesis using Smallest AI's WebSocket API.
-    Supports streaming audio generation with configurable voice parameters and
-    language settings. Handles interruptions by reconnecting the WebSocket.
-
-    Example::
-
-        tts = SmallestTTSService(
-            api_key="your-api-key",
-            settings=SmallestTTSService.Settings(
-                voice="sophia",
-                language=Language.EN,
-                speed=1.0,
-            ),
-        )
+    Streams synthesized audio over a WebSocket connection to Smallest AI's
+    Waves API, correlating audio and (optionally) word timestamps with the
+    active turn via Pipecat's audio-context mechanism.
     """
 
-    Settings = SmallestTTSSettings
-    _settings: Settings
+    _settings: SmallestTTSSettings
+
+    class InputParams(BaseModel):
+        """Configuration parameters for Smallest AI TTS service.
+
+        Parameters:
+            language: Language for synthesis. Defaults to English.
+            speed: Speech speed multiplier (0.5-2.0).
+        """
+
+        language: Optional[Language] = Language.EN
+        speed: Optional[float] = None
 
     def __init__(
         self,
         *,
         api_key: str,
+        voice: Optional[str] = None,
+        model: str = "lightning_v3.1_pro",
         base_url: str = "wss://api.smallest.ai",
-        sample_rate: int | None = None,
-        settings: Settings | None = None,
+        sample_rate: Optional[int] = None,
+        output_format: str = "pcm",
+        word_timestamps: bool = True,
+        params: Optional[InputParams] = None,
         **kwargs,
     ):
         """Initialize the Smallest AI WebSocket TTS service.
 
         Args:
             api_key: Smallest AI API key for authentication.
+            voice: Voice identifier. Defaults to the model's default voice.
+            model: Model identifier: ``lightning_v3.1`` or ``lightning_v3.1_pro``.
             base_url: Base WebSocket URL for the Smallest API.
-            sample_rate: Audio sample rate in Hz. If None, uses default.
-            settings: Runtime-updatable settings for the TTS service.
-            **kwargs: Additional arguments passed to parent InterruptibleTTSService.
+            sample_rate: Output audio sample rate in Hz. If None, uses the
+                pipeline's configured sample rate.
+            output_format: Audio format returned by the API. Fixed at init time.
+            word_timestamps: Whether to request per-word timing events. Supported
+                on base-queue English/Hindi voices; other voices emit no word
+                events but function normally, so leaving this on is safe.
+            params: Additional configuration parameters.
+            **kwargs: Additional arguments passed to parent AudioContextWordTTSService.
         """
-        default_settings = self.Settings(
-            model=SmallestTTSModel.LIGHTNING_V3_1.value,
-            voice="sophia",
-            language=Language.EN,
-            speed=None,
-            consistency=None,
-            similarity=None,
-            enhancement=None,
-        )
-
-        if settings is not None:
-            default_settings.apply_update(settings)
-
         super().__init__(
+            push_text_frames=not word_timestamps,
             push_stop_frames=True,
-            push_start_frame=True,
             pause_frame_processing=True,
             sample_rate=sample_rate,
-            settings=default_settings,
             **kwargs,
         )
 
+        params = params or SmallestTTSService.InputParams()
+        resolved_voice = voice or _MODEL_DEFAULT_VOICES.get(model, "meher")
+
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
+        self._output_format = output_format
+        self._word_timestamps = word_timestamps
+
+        self._settings = SmallestTTSSettings(
+            model=model,
+            voice=resolved_voice,
+            language=self.language_to_service_language(params.language)
+            if params.language
+            else "en",
+            speed=params.speed if params.speed is not None else NOT_GIVEN,
+        )
+        self._sync_model_name_to_metrics()
+
         self._receive_task = None
         self._keepalive_task = None
 
-    def can_generate_metrics(self) -> bool:
-        """Check if this service can generate processing metrics.
+        # Smallest reports word timestamps relative to each request's own
+        # audio, so multiple run_tts() calls within one turn are offset onto
+        # a continuous timeline using the cumulative time of prior requests.
+        # Mirrors the pattern used by RimeTTSService in this codebase.
+        self._cumulative_time: float = 0.0
+        self._request_end_time: float = 0.0
+        self._wt_request_id: Optional[str] = None
 
-        Returns:
-            True, as Smallest service supports metrics generation.
-        """
+    def can_generate_metrics(self) -> bool:
+        """Check if this service can generate processing metrics."""
         return True
 
-    async def flush_audio(self, context_id: str | None = None):
-        """Flush any pending audio data."""
-        logger.trace(f"{self}: flushing audio")
-
     def language_to_service_language(self, language: Language) -> str | None:
-        """Convert a Language enum to Smallest service language format.
-
-        Args:
-            language: The language to convert.
-
-        Returns:
-            The Smallest-specific language code, or None if not supported.
-        """
+        """Convert a Language enum to Smallest service language format."""
         return language_to_smallest_tts_language(language)
 
     def _build_msg(self, text: str) -> dict:
-        """Build a WebSocket message for the Smallest API.
-
-        Args:
-            text: The text to synthesize.
-
-        Returns:
-            Dictionary with the API message payload.
-        """
+        """Build a WebSocket message for the Smallest API."""
         msg = {
             "text": text,
             "voice_id": self._settings.voice,
+            "model": self._settings.model,
             "language": self._settings.language,
             "sample_rate": self.sample_rate,
+            "output_format": self._output_format,
         }
 
-        if self._settings.speed is not None:
+        if is_given(self._settings.speed) and self._settings.speed is not None:
             msg["speed"] = self._settings.speed
 
-        # consistency, similarity, enhancement are only supported by lightning-v2
-        if self._settings.model == SmallestTTSModel.LIGHTNING_V2.value:
-            if self._settings.consistency is not None:
-                msg["consistency"] = self._settings.consistency
-            if self._settings.similarity is not None:
-                msg["similarity"] = self._settings.similarity
-            if self._settings.enhancement is not None:
-                msg["enhancement"] = self._settings.enhancement
+        if self._word_timestamps:
+            msg["word_timestamps"] = True
 
         return msg
 
     def _build_websocket_url(self) -> str:
-        """Build the WebSocket URL from base URL and model."""
-        return f"{self._base_url}/waves/v1/{self._settings.model}/get_speech/stream"
+        return f"{self._base_url}/waves/v1/tts/live"
 
     async def start(self, frame: StartFrame):
-        """Start the Smallest TTS service.
-
-        Args:
-            frame: The start frame containing initialization parameters.
-        """
+        """Start the Smallest TTS service."""
         await super().start(frame)
         await self._connect()
 
     async def stop(self, frame: EndFrame):
-        """Stop the Smallest TTS service.
-
-        Args:
-            frame: The end frame.
-        """
+        """Stop the Smallest TTS service."""
         await super().stop(frame)
         await self._disconnect()
 
     async def cancel(self, frame: CancelFrame):
-        """Cancel the Smallest TTS service.
-
-        Args:
-            frame: The cancel frame.
-        """
+        """Cancel the Smallest TTS service."""
         await super().cancel(frame)
         await self._disconnect()
 
-    async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
-        """Apply a settings delta, reconnecting if model changed.
+    async def _update_settings(self, update: TTSSettings) -> dict[str, Any]:
+        """Apply a settings delta. Fields take effect on the next message sent."""
+        return await super()._update_settings(update)
 
-        Per-message fields (speed, consistency, similarity, enhancement, voice,
-        language) apply automatically on the next ``_build_msg`` call. A model
-        change requires reconnecting because the model is part of the WebSocket URL.
+    async def flush_audio(self, context_id: str | None = None):
+        """Flush any pending audio data.
+
+        Args:
+            context_id: The specific context to flush. Smallest has no explicit
+                flush/finalize message on this endpoint, so this is a no-op —
+                present only to satisfy the base class's call signature.
         """
-        changed = await super()._update_settings(delta)
-
-        if not changed:
-            return changed
-
-        if "model" in changed:
-            await self._disconnect()
-            await self._connect()
-
-        return changed
+        logger.trace(f"{self}: flushing audio")
 
     async def _connect(self):
-        """Connect to Smallest WebSocket and start receive task."""
+        """Connect to Smallest WebSocket and start receive/keepalive tasks."""
         await super()._connect()
 
         await self._connect_websocket()
@@ -333,18 +305,11 @@ class SmallestTTSService(InterruptibleTTSService):
                 error_msg=f"Smallest TTS error closing websocket: {e}", exception=e
             )
         finally:
+            await self.remove_active_audio_context()
             self._websocket = None
             await self._call_event_handler("on_disconnected")
 
     def _get_websocket(self):
-        """Get the WebSocket connection if available.
-
-        Returns:
-            The active WebSocket connection.
-
-        Raises:
-            Exception: If no WebSocket connection is available.
-        """
         if self._websocket:
             return self._websocket
         raise Exception("Websocket not connected")
@@ -362,9 +327,24 @@ class SmallestTTSService(InterruptibleTTSService):
             msg = {
                 "text": " ",
                 "voice_id": self._settings.voice,
+                "model": self._settings.model,
                 "language": self._settings.language,
             }
             await self._websocket.send(json.dumps(msg))
+
+    def _advance_word_timestamp_request(self, request_id: Optional[str]):
+        """Roll the turn offset forward when word timestamps cross into a new request.
+
+        Smallest reports word timestamps relative to each request's own audio
+        and does not emit a per-request "complete", so a change in
+        ``request_id`` marks the boundary between requests within a turn.
+        """
+        if request_id == self._wt_request_id:
+            return
+        if self._wt_request_id is not None:
+            self._cumulative_time += self._request_end_time
+            self._request_end_time = 0.0
+        self._wt_request_id = request_id
 
     async def _receive_messages(self):
         """Receive and process messages from the Smallest WebSocket API."""
@@ -376,6 +356,7 @@ class SmallestTTSService(InterruptibleTTSService):
                 await self.stop_all_metrics()
             elif status == "chunk":
                 await self.stop_ttfb_metrics()
+                await self.start_word_timestamps()
                 context_id = self.get_active_audio_context_id()
                 frame = TTSAudioRawFrame(
                     audio=base64.b64decode(msg["data"]["audio"]),
@@ -384,16 +365,28 @@ class SmallestTTSService(InterruptibleTTSService):
                     context_id=context_id,
                 )
                 await self.append_to_audio_context(context_id, frame)
+            elif status == "word_timestamp":
+                self._advance_word_timestamp_request(msg.get("request_id"))
+                data = msg.get("data", {})
+                word = data.get("word")
+                start = data.get("start")
+                end = data.get("end")
+                if word is not None and start is not None:
+                    context_id = self.get_active_audio_context_id()
+                    await self.add_word_timestamps(
+                        [(word, start + self._cumulative_time)], context_id=context_id
+                    )
+                    if end is not None:
+                        self._request_end_time = max(self._request_end_time, end)
             elif status == "error":
-                context_id = self.get_active_audio_context_id()
-                await self.push_frame(TTSStoppedFrame(context_id=context_id))
+                await self.push_frame(TTSStoppedFrame())
                 await self.stop_all_metrics()
                 await self.push_error(error_msg=f"Smallest TTS error: {msg.get('error', msg)}")
             else:
                 logger.warning(f"{self} unknown message status: {msg}")
 
     @traced_tts
-    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Generate speech from text using Smallest's WebSocket streaming API.
 
         Args:
@@ -401,7 +394,7 @@ class SmallestTTSService(InterruptibleTTSService):
             context_id: Unique identifier for this TTS context.
 
         Yields:
-            Frame: Audio arrives via WebSocket receive task.
+            Frame: Audio arrives via the WebSocket receive task.
         """
         logger.debug(f"{self}: Generating TTS [{text}]")
 
@@ -410,6 +403,14 @@ class SmallestTTSService(InterruptibleTTSService):
                 await self._connect()
 
             try:
+                if not self.has_active_audio_context():
+                    await self.start_ttfb_metrics()
+                    yield TTSStartedFrame(context_id=context_id)
+                    self._cumulative_time = 0.0
+                    self._request_end_time = 0.0
+                    self._wt_request_id = None
+                    await self.create_audio_context(context_id)
+
                 msg = self._build_msg(text=text)
                 await self._get_websocket().send(json.dumps(msg))
                 await self.start_tts_usage_metrics(text)
