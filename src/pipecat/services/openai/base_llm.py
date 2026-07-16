@@ -387,13 +387,18 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         params["stream"] = False
         params.pop("stream_options", None)
 
-        # Override max_tokens if provided
+        # Override max token count if provided. Both keys are ALWAYS present in
+        # params (as NOT_GIVEN when unconfigured), so membership can't tell
+        # which one the service actually uses — route the override to the key
+        # that carries a real value and neutralize the other. Setting both is
+        # an invalid_parameter_combination error on OpenAI.
         if max_tokens is not None:
-            # Use max_completion_tokens for newer models, fallback to max_tokens
-            if "max_completion_tokens" in params:
+            if isinstance(params.get("max_completion_tokens"), int):
                 params["max_completion_tokens"] = max_tokens
+                params["max_tokens"] = NOT_GIVEN
             else:
                 params["max_tokens"] = max_tokens
+                params["max_completion_tokens"] = NOT_GIVEN
 
         # LLM completion
         response = await self._client.chat.completions.create(**params)
