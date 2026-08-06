@@ -147,7 +147,6 @@ class ClassifierGate(NotifierGate):
         self._conversation_notifier = conversation_notifier
         self._conversation_detected = False
         self._conversation_task: asyncio.Task | None = None
-        self._first_bot_sentence_completed = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the processor with required components.
@@ -182,20 +181,36 @@ class ClassifierGate(NotifierGate):
         if isinstance(frame, (LLMRunFrame, LLMMessagesAppendFrame)):
             return
 
-        # Stop the early-classification fast path once the bot finishes its
-        # first sentence — by then we've had enough time to hear the callee
-        # respond naturally and the classifier branch can rely on the normal
-        # transcription flow.
-        if isinstance(frame, BotStoppedSpeakingFrame):
-            self._first_bot_sentence_completed = True
-
-        # Early-detection fast path: while the bot is still speaking its first
-        # sentence, feed every transcription straight into the classifier LLM
-        # so we can decide CONVERSATION vs VOICEMAIL as quickly as possible.
-        if (
-            isinstance(frame, TranscriptionFrame)
-            and not self._first_bot_sentence_completed
-        ):
+        # Early-detection fast path: feed every transcription straight into the
+        # classifier LLM so we can decide CONVERSATION vs VOICEMAIL as quickly
+        # as possible.
+        #
+        # This used to stop at the first BotStoppedSpeakingFrame, on the
+        # assumption that the classifier branch could then "rely on the normal
+        # transcription flow". It cannot. That branch's aggregator uses
+        # ExternalUserTurnStrategies, so it only commits when the MAIN
+        # aggregator broadcasts user-turn frames — and the main aggregator is
+        # muted while the bot speaks (MuteUntilFirstBotComplete +
+        # is_welcome_message_interruption=false). Between the first bot-stop and
+        # the first committed user turn the classifier could not run by ANY
+        # route, and that dead zone reopens on every later bot utterance.
+        #
+        # Worse, BotStoppedSpeakingFrame is an AUDIO UNDERRUN signal emitted per
+        # TTS context, so the old window's width was decided by how TTS happened
+        # to chunk the greeting: ~15s for a single-utterance welcome, ~2.7s for a
+        # sentence-streamed one. Recording 6114349 lost a textbook voicemail that
+        # way — window shut at 4.18s, STT finalized at 12.17s, 0 classifier runs
+        # in 64s.
+        #
+        # The honest condition is "no verdict yet", which the gate already
+        # tracks: _gate_opened goes False the moment ClassificationProcessor
+        # latches a decision. Feeding while undecided costs nothing extra on a
+        # normal call (the first transcript decides it and the gate shuts) and
+        # keeps detection alive for exactly as long as it is still undecided.
+        # A response that parses as neither word decides nothing, so we simply
+        # ask again on the next transcript — Gemini returned '' on a live call
+        # (2026-08-05) and retrying is the right answer there.
+        if isinstance(frame, TranscriptionFrame) and self._gate_opened:
             await self.push_frame(
                 LLMMessagesAppendFrame(
                     messages=[{"role": "user", "content": frame.text}]
