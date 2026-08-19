@@ -677,11 +677,30 @@ class CartesiaTTSService(WebsocketTTSService):
                 self.reset_active_audio_context()
             elif msg["type"] == "flush_done":
                 # Cartesia emits flush_done as a per-transcript boundary marker
-                # within a context (e.g. when max_buffer_delay_ms=0 causes the
-                # server to flush each submission). We don't need it: each turn
-                # already has its own context_id and audio chunks are tagged
-                # with it. Acknowledge silently.
-                pass
+                # within a context. In SENTENCE mode max_buffer_delay_ms is 0
+                # (see __init__), so the server flushes every submission and
+                # this is the ONLY per-sentence "that sentence's audio is fully
+                # sent" signal on the wire: done is per context, and a context
+                # is a whole turn. Verified against the live API 2026-08-19:
+                # flush_id increments 0,1,2 and each arrives after its own
+                # sentence's chunks. Nothing in the base service needs it, but
+                # anything splicing audio into this stream does, so it is
+                # offered as an optional hook rather than dropped.
+                #
+                # Isolated on purpose. This runs inside the websocket receive
+                # loop, and _receive_task_handler treats ANY exception escaping
+                # here as a connection failure and reconnects
+                # (websocket_service.py). A bug in a listener would then present
+                # as a network fault and cost the call its in-flight audio, so a
+                # listener may fail but may not take the socket with it. It also
+                # must not block: an await that does real I/O here stalls every
+                # subsequent audio chunk for the call.
+                handler = getattr(self, "on_sentence_flushed", None)
+                if handler:
+                    try:
+                        await handler(ctx_id, msg.get("flush_id"))
+                    except Exception as e:  # noqa: BLE001 - see above
+                        logger.warning(f"{self} flush_done listener failed: {e}")
             else:
                 await self.push_error(error_msg=f"Error, unknown message type: {msg}")
 
