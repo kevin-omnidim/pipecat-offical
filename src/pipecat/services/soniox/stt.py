@@ -232,6 +232,9 @@ class SonioxSTTSettings(STTSettings):
         enable_speaker_diarization: Whether to enable speaker diarization.
         enable_language_identification: Whether to enable language identification.
         max_endpoint_delay_ms: Max ms before endpoint detection finalizes the turn (500-3000).
+        max_non_final_tokens_duration_ms: Max ms a token may stay non-final before Soniox
+            forces it final (360-6000, server default 4000 region — bounds verified live
+            2026-08-20). Lower = earlier finals at a small accuracy cost.
         client_reference_id: Client reference ID to use for transcription.
     """
 
@@ -243,6 +246,9 @@ class SonioxSTTSettings(STTSettings):
         default_factory=lambda: NOT_GIVEN
     )
     max_endpoint_delay_ms: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    max_non_final_tokens_duration_ms: int | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
     client_reference_id: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
@@ -311,6 +317,7 @@ class SonioxSTTService(WebsocketSTTService):
             enable_speaker_diarization=False,
             enable_language_identification=False,
             max_endpoint_delay_ms=None,
+            max_non_final_tokens_duration_ms=None,
             client_reference_id=None,
         )
 
@@ -530,6 +537,7 @@ class SonioxSTTService(WebsocketSTTService):
                 "num_channels": self._num_channels,
                 "enable_endpoint_detection": enable_endpoint_detection,
                 "max_endpoint_delay_ms": s.max_endpoint_delay_ms,
+                "max_non_final_tokens_duration_ms": s.max_non_final_tokens_duration_ms,
                 "sample_rate": self.sample_rate,
                 "language_hints": _prepare_language_hints(assert_given(s.language_hints)),
                 "language_hints_strict": s.language_hints_strict,
