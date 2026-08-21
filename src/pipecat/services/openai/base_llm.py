@@ -492,6 +492,10 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                         func_idx += 1
                     if tool_call.function and tool_call.function.name:
                         function_name += tool_call.function.name
+                        # Terminal-tool cut: once the streamed name matches
+                        # (e.g. end_call), later content deltas of this same
+                        # completion are suppressed in _push_llm_text.
+                        self.note_streamed_tool_name(function_name)
                         tool_call_id = tool_call.id
                     if tool_call.function and tool_call.function.arguments:
                         # Keep iterating through the response to collect all the argument fragments
@@ -553,6 +557,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         if isinstance(frame, LLMContextFrame):
             try:
                 await self.push_frame(LLMFullResponseStartFrame())
+                await self.reset_terminal_tool_state()
                 await self.start_processing_metrics()
                 await self._process_context(frame.context)
             except httpx.TimeoutException as e:

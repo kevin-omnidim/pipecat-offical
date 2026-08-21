@@ -266,6 +266,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         function_call_timeout_secs: float | None = None,
         enable_async_tool_cancellation: bool = False,
         settings: LLMSettings | None = None,
+        terminal_tool_names: Optional[set] = None,
         **kwargs,
     ):
         """Initialize the LLM service.
@@ -297,6 +298,20 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         self._run_in_parallel = run_in_parallel
         self._group_parallel_tools = group_parallel_tools
         self._function_call_timeout_secs = function_call_timeout_secs
+        # Tools whose invocation marks the model's spoken turn as FINAL. Once a
+        # streamed tool-call fragment names one of these, every later content
+        # delta of the SAME completion is suppressed before it can reach TTS:
+        # the model has decided the turn is over, and what follows is
+        # post-decision text a caller should never hear (prod 6853507 streamed
+        # 483 chars of self-narrated dialogue after calling end_call and spoke
+        # 20.4s). The suppression must live HERE in the stream loop, because by
+        # the time any downstream processor sees FunctionCallInProgressFrame (a
+        # ControlFrame, processed in order) the same completion's text has
+        # already passed it.
+        self._terminal_tool_names: set = set(terminal_tool_names or ())
+        self._terminal_tool_seen: bool = False
+        self._terminal_suppressed_chars: int = 0
+        self._register_event_handler("on_terminal_tool_content_suppressed")
         self._enable_async_tool_cancellation: bool = enable_async_tool_cancellation
         self._filter_incomplete_user_turns: bool = False
         self._async_tool_cancellation_enabled: bool = False
@@ -524,6 +539,29 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
 
         await super().push_frame(frame, direction)
 
+    def set_terminal_tool_names(self, names: set):
+        """Declare which tools end the model's spoken turn (see __init__)."""
+        self._terminal_tool_names = set(names or ())
+
+    def note_streamed_tool_name(self, name: str):
+        """Record a tool name seen live in the stream, BEFORE dispatch.
+
+        Streaming loops call this as tool-call fragments arrive. When the
+        accumulated name matches a terminal tool, _push_llm_text suppresses
+        every later content delta of this completion.
+        """
+        if name and name in self._terminal_tool_names:
+            self._terminal_tool_seen = True
+
+    async def reset_terminal_tool_state(self):
+        """Start-of-completion reset; reports what the last one suppressed."""
+        if self._terminal_suppressed_chars:
+            await self._call_event_handler(
+                "on_terminal_tool_content_suppressed", self._terminal_suppressed_chars
+            )
+        self._terminal_tool_seen = False
+        self._terminal_suppressed_chars = 0
+
     async def _push_llm_text(self, text: str):
         """Push LLM text, using turn completion detection if enabled.
 
@@ -533,6 +571,9 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         Args:
             text: The text content from the LLM to push.
         """
+        if self._terminal_tool_seen:
+            self._terminal_suppressed_chars += len(text)
+            return
         if self._filter_incomplete_user_turns:
             await self._push_turn_text(text)
         else:

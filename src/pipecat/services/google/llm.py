@@ -431,6 +431,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
     @traced_llm
     async def _process_context(self, context: LLMContext):
         await self.push_frame(LLMFullResponseStartFrame())
+        await self.reset_terminal_tool_state()
 
         prompt_tokens = 0
         completion_tokens = 0
@@ -482,6 +483,8 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                                     await self._push_llm_text(part.text)
                             elif part.function_call:
                                 function_call = part.function_call
+                                # Terminal-tool cut: mirrors the OpenAI loop.
+                                self.note_streamed_tool_name(function_call.name)
                                 function_call_id = function_call.id or str(uuid.uuid4())
                                 logger.debug(
                                     f"Function call: {function_call.name}:{function_call_id}"
