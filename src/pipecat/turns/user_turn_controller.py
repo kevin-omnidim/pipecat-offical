@@ -24,7 +24,7 @@ from pipecat.turns.user_start import (
     UserTurnStartedParams,
 )
 from pipecat.turns.user_stop import BaseUserTurnStopStrategy, UserTurnStoppedParams
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies, UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import BaseTaskManager
 from pipecat.utils.base_object import BaseObject
 
@@ -93,6 +93,22 @@ class UserTurnController(BaseObject):
         self._user_turn_stop_timeout = user_turn_stop_timeout
 
         self._user_speaking = False
+        # Whether UserStarted/StoppedSpeakingFrame count as speech evidence.
+        #
+        # With external strategies they are the authoritative speech signal
+        # (e.g. Deepgram Flux, or an STT that owns turn detection). With
+        # standard VAD/transcription strategies the same frames reaching this
+        # controller are its OWN turn-start/stop broadcasts echoing back, and
+        # treating an echo as evidence lets a phantom turn-start — a late
+        # transcript re-opening a turn — latch ``_user_speaking`` stale-true.
+        # Nothing then clears it, and both routes out of a turn check it:
+        # ``_trigger_user_turn_stop`` refuses to finalize and the stop-timeout
+        # watchdog refuses to fire, so the turn never ends and the bot waits
+        # for a caller who has finished speaking. Only VAD frames are evidence
+        # there.
+        self._speaking_frames_authoritative = isinstance(
+            user_turn_strategies, ExternalUserTurnStrategies
+        )
 
         self._user_turn = False
         self._user_turn_stop_timeout_event = asyncio.Event()
@@ -144,6 +160,7 @@ class UserTurnController(BaseObject):
         """
         await self._cleanup_strategies()
         self._user_turn_strategies = strategies
+        self._speaking_frames_authoritative = isinstance(strategies, ExternalUserTurnStrategies)
         await self._setup_strategies()
 
     async def process_frame(self, frame: Frame):
@@ -216,13 +233,17 @@ class UserTurnController(BaseObject):
             s.remove_event_handler("on_user_turn_stopped", self._on_user_turn_stopped)
 
     async def _handle_user_started_speaking(self, frame: UserStartedSpeakingFrame):
-        self._user_speaking = True
+        # Speech evidence only where these frames are authoritative; otherwise
+        # this is our own broadcast echoing back (see __init__).
+        if self._speaking_frames_authoritative:
+            self._user_speaking = True
 
-        # The user started talking, let's reset the user turn timeout.
+        # Activity either way, so reset the user turn timeout.
         self._user_turn_stop_timeout_event.set()
 
     async def _handle_user_stopped_speaking(self, frame: UserStoppedSpeakingFrame):
-        self._user_speaking = False
+        if self._speaking_frames_authoritative:
+            self._user_speaking = False
 
         # The user stopped talking, let's reset the user turn timeout.
         self._user_turn_stop_timeout_event.set()
