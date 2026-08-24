@@ -142,6 +142,51 @@ async def test_unchanged_interim_is_not_pushed_again(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dedupe_resets_on_an_endpoint_that_committed_nothing(monkeypatch):
+    """An endpoint can arrive with every token still non-final, so nothing is
+    committed. The marker must clear anyway — otherwise the next utterance's
+    first interim is suppressed if it repeats, and this pipeline takes the turn
+    start from interim word count."""
+    pushed = []
+    service = _pushing_service(monkeypatch, pushed)
+    service._websocket = _FakeWebsocket(
+        [
+            json.dumps({"tokens": [{"text": "yes", "is_final": False}]}),
+            # Endpoint with no finalized tokens: nothing to flush.
+            json.dumps({"tokens": [{"text": END_TOKEN, "is_final": True}]}),
+            json.dumps({"tokens": [{"text": "yes", "is_final": False}]}),
+        ]
+    )
+
+    await service._receive_messages()
+
+    assert pushed == [
+        (InterimTranscriptionFrame, "yes"),
+        (InterimTranscriptionFrame, "yes"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dedupe_marker_does_not_survive_a_reconnect(monkeypatch):
+    """A reconnect starts a fresh interim stream; a marker carried over from the
+    dead connection would swallow its first interim."""
+    pushed = []
+    service = _pushing_service(monkeypatch, pushed)
+
+    service._websocket = _FakeWebsocket([json.dumps({"tokens": [{"text": "hello", "is_final": False}]})])
+    await service._receive_messages()
+
+    # Same first interim on the new connection.
+    service._websocket = _FakeWebsocket([json.dumps({"tokens": [{"text": "hello", "is_final": False}]})])
+    await service._receive_messages()
+
+    assert pushed == [
+        (InterimTranscriptionFrame, "hello"),
+        (InterimTranscriptionFrame, "hello"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_dedupe_resets_after_a_final_so_a_repeated_phrase_still_pushes(monkeypatch):
     """The buffer empties on the endpoint flush, so the next utterance must be
     able to push the same text the previous one ended on."""

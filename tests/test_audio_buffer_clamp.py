@@ -28,9 +28,9 @@ class _PassthroughResampler:
         return audio
 
 
-async def _make_processor() -> AudioBufferProcessor:
+async def _make_processor(*, buffer_size: int = 0) -> AudioBufferProcessor:
     """A mono processor recording at 16 kHz, initialised without a full pipeline."""
-    processor = AudioBufferProcessor(sample_rate=16000, num_channels=1)
+    processor = AudioBufferProcessor(sample_rate=16000, num_channels=1, buffer_size=buffer_size)
     processor._input_resampler = _PassthroughResampler()
     processor._output_resampler = _PassthroughResampler()
 
@@ -95,7 +95,37 @@ class TestBurstDeliveryClamp(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(p._user_audio_buffer), expected_total)
         await p.cleanup()
 
+    async def test_the_clamp_still_holds_across_a_periodic_flush(self):
+        """Production sets buffer_size (30 s), so the buffer is emptied mid-call
+        and the cap depends on the flushed-byte tally rather than on
+        ``len(buffer)`` alone. If that tally is wrong the cap goes unbounded and
+        the clamp quietly stops working after the first flush."""
+        one_second = self._BYTES_PER_SECOND
+        p = await _make_processor(buffer_size=one_second)  # flush every ~1 s
+        frame = b"\x01" * 640  # 20 ms @ 16 kHz mono
 
+        with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
+            p._recording_start_time = 0.0
+            p._last_user_buffer_update_time = 0.0
+
+            # 2 s of honest, on-time audio — crosses the flush threshold twice.
+            for i in range(100):
+                mock_time.monotonic.return_value = 0.02 * (i + 1)
+                await self._send(p, frame)
+
+            self.assertGreater(
+                p._user_flushed_bytes, 0, "the periodic flush never fired")
+
+            # Now a stall whose backlog lands as a burst, then a genuine mute.
+            mock_time.monotonic.return_value = 3.0
+            for _ in range(50):
+                await self._send(p, frame)
+            mock_time.monotonic.return_value = 5.0
+            await self._send(p, frame)
+
+        total = p._user_flushed_bytes + len(p._user_audio_buffer)
+        self.assertEqual(total, int(5.0 * self._BYTES_PER_SECOND))
+        await p.cleanup()
 
 
 if __name__ == "__main__":

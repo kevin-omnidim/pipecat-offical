@@ -689,6 +689,9 @@ class SonioxSTTService(WebsocketSTTService):
         """
         # Transcription frame will be only sent after we get the "endpoint" event.
         self._final_transcription_buffer = []
+        # A reconnect starts a fresh interim stream, so the dedupe marker from
+        # the old connection must not suppress its first interim.
+        self._last_interim_text = None
 
         async def send_endpoint_transcript():
             if self._final_transcription_buffer:
@@ -716,9 +719,12 @@ class SonioxSTTService(WebsocketSTTService):
                 await self._handle_transcription(text, is_final=True, language=language)
                 await self.stop_processing_metrics()
                 self._final_transcription_buffer = []
-                # The next utterance starts from an empty buffer, so its first
-                # interim must push even if it repeats this one's text.
-                self._last_interim_text = None
+            # Outside the buffer check on purpose: an endpoint can arrive with
+            # nothing committed (every token still non-final), and the next
+            # utterance must be able to repeat this one's wording. Suppressing
+            # its first interim would delay the turn start, which this pipeline
+            # takes from interim word count.
+            self._last_interim_text = None
 
         async def finalize_turn():
             await send_endpoint_transcript()

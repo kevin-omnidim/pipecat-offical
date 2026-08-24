@@ -373,6 +373,13 @@ class AudioBufferProcessor(FrameProcessor):
         this bug has earned. ``recording.stopped.drift_ms`` reports what is
         left, per call.
 
+        The anchor is also recording start, not first audio, so a stream that
+        begins late (media arriving after the pipeline is up) leaves that
+        interval in the wall reference but never in the track position — the cap
+        carries it as slack. It only ever makes the cap looser, so nothing is
+        over-trimmed; a per-track anchor set on each track's first frame is the
+        tighter version if drift telemetry shows it mattering.
+
         Args:
             buffer: The audio buffer to pad (user or bot).
             last_update_time: Monotonic time of the last write to this buffer,
