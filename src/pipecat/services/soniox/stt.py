@@ -238,12 +238,17 @@ class SonioxSTTSettings(STTSettings):
         endpoint_sensitivity: Endpoint detection sensitivity (-1.0 to 1.0); higher finalizes sooner.
         endpoint_latency_adjustment_level: Reduces endpoint latency vs. the default (0-3); higher
             finalizes sooner but may reduce accuracy.
+        max_non_final_tokens_duration_ms: Max ms a token may stay non-final before Soniox
+            forces it final (360-6000, server default 4000 region — bounds verified live
+            2026-08-20). Lower = earlier finals at a small accuracy cost.
         client_reference_id: Client reference ID to use for transcription.
 
-    The ``max_endpoint_delay_ms``, ``endpoint_sensitivity`` and
-    ``endpoint_latency_adjustment_level`` settings only take effect when
-    ``vad_force_turn_endpoint=False``; otherwise Soniox endpoint detection is
-    disabled and these settings are ignored.
+    Soniox endpoint detection is always enabled, so ``max_endpoint_delay_ms``,
+    ``endpoint_sensitivity`` and ``endpoint_latency_adjustment_level`` take
+    effect regardless of ``vad_force_turn_endpoint``. With
+    ``vad_force_turn_endpoint=True`` the pipeline VAD is the fast path for
+    ending a turn and server-side detection is the backstop for speech the VAD
+    misses.
     """
 
     language_hints: list[Language] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
@@ -256,6 +261,9 @@ class SonioxSTTSettings(STTSettings):
     max_endpoint_delay_ms: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     endpoint_sensitivity: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     endpoint_latency_adjustment_level: int | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    max_non_final_tokens_duration_ms: int | None | _NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
     client_reference_id: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
@@ -340,6 +348,7 @@ class SonioxSTTService(WebsocketSTTService):
             max_endpoint_delay_ms=None,
             endpoint_sensitivity=None,
             endpoint_latency_adjustment_level=None,
+            max_non_final_tokens_duration_ms=None,
             client_reference_id=None,
         )
 
@@ -390,6 +399,13 @@ class SonioxSTTService(WebsocketSTTService):
 
         self._final_transcription_buffer = []
         self._last_tokens_received: float | None = None
+        # Last interim text pushed downstream. Soniox sends periodic messages
+        # even when no new tokens arrive, and re-pushing the unchanged buffer
+        # as a fresh interim every ~1s makes stale text look like continuous
+        # user activity downstream (re-triggers turn starts, starves the turn
+        # stop watchdog, resets the user-idle timer). Only push an interim
+        # when its text actually changed.
+        self._last_interim_text: str | None = None
 
         # Turn tracking for Soniox turn-detection mode.
         self._user_turn_open = False
@@ -590,9 +606,15 @@ class SonioxSTTService(WebsocketSTTService):
                 await self.push_error(error_msg=f"Unable to connect to Soniox API at {self._url}")
                 raise Exception(f"Unable to connect to Soniox API at {self._url}")
 
-            # If vad_force_turn_endpoint is not enabled, we need to enable endpoint detection.
-            # Either one or the other is required.
-            enable_endpoint_detection = not self._vad_force_turn_endpoint
+            # Endpoint detection is always on, even with vad_force_turn_endpoint:
+            # Soniox then emits <end> tokens from its own server-side silence
+            # detection, so committed tokens still flush when the pipeline VAD
+            # never fires a stop (e.g. soft speech under bot audio, where VAD
+            # runs with raised thresholds). The VAD finalize message remains a
+            # faster path when it does fire. Running both is safe: a flush
+            # empties the buffer and send_endpoint_transcript() is a no-op on
+            # an empty buffer, so the second <end>/<fin> cannot double-emit.
+            enable_endpoint_detection = True
 
             s = self._settings
 
@@ -610,6 +632,7 @@ class SonioxSTTService(WebsocketSTTService):
                 "max_endpoint_delay_ms": s.max_endpoint_delay_ms,
                 "endpoint_sensitivity": s.endpoint_sensitivity,
                 "endpoint_latency_adjustment_level": s.endpoint_latency_adjustment_level,
+                "max_non_final_tokens_duration_ms": s.max_non_final_tokens_duration_ms,
                 "sample_rate": self.sample_rate,
                 "language_hints": _prepare_language_hints(assert_given(s.language_hints)),
                 "language_hints_strict": s.language_hints_strict,
@@ -618,6 +641,12 @@ class SonioxSTTService(WebsocketSTTService):
                 "enable_language_identification": s.enable_language_identification,
                 "client_reference_id": s.client_reference_id,
             }
+
+            # Log the negotiated config (minus the key) so a call's endpointing
+            # settings can be confirmed on the wire rather than inferred.
+            logger.debug(
+                f"Soniox connect config: { {k: v for k, v in config.items() if k != 'api_key'} }"
+            )
 
             # Send the configuration message.
             await self._websocket.send(json.dumps(config))
@@ -665,6 +694,10 @@ class SonioxSTTService(WebsocketSTTService):
             if self._final_transcription_buffer:
                 text = "".join(map(lambda token: token["text"], self._final_transcription_buffer))
                 language = _language_from_tokens(self._final_transcription_buffer)
+                logger.debug(
+                    f"Soniox endpoint flush: {len(self._final_transcription_buffer)} tokens, "
+                    f"text={text[:80]!r}"
+                )
                 # Report usage before the transcription frame so tracing can
                 # attach it to the STT span the frame closes.
                 await self.emit_stt_usage_metrics()
@@ -683,6 +716,9 @@ class SonioxSTTService(WebsocketSTTService):
                 await self._handle_transcription(text, is_final=True, language=language)
                 await self.stop_processing_metrics()
                 self._final_transcription_buffer = []
+                # The next utterance starts from an empty buffer, so its first
+                # interim must push even if it repeats this one's text.
+                self._last_interim_text = None
 
         async def finalize_turn():
             await send_endpoint_transcript()
@@ -731,16 +767,19 @@ class SonioxSTTService(WebsocketSTTService):
                         map(lambda token: token["text"], non_final_transcription)
                     )
 
-                    await self.push_frame(
-                        InterimTranscriptionFrame(
-                            # Even final tokens are sent as interim tokens as we want to send
-                            # nicely formatted messages - therefore waiting for the endpoint.
-                            text=final_text + non_final_text,
-                            user_id=self._user_id,
-                            timestamp=time_now_iso8601(),
-                            result=self._final_transcription_buffer + non_final_transcription,
+                    interim_text = final_text + non_final_text
+                    if interim_text != self._last_interim_text:
+                        self._last_interim_text = interim_text
+                        await self.push_frame(
+                            InterimTranscriptionFrame(
+                                # Even final tokens are sent as interim tokens as we want to send
+                                # nicely formatted messages - therefore waiting for the endpoint.
+                                text=interim_text,
+                                user_id=self._user_id,
+                                timestamp=time_now_iso8601(),
+                                result=self._final_transcription_buffer + non_final_transcription,
+                            )
                         )
-                    )
 
                 error_code = content.get("error_code")
                 error_message = content.get("error_message")
