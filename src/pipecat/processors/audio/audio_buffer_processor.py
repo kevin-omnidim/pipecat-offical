@@ -92,6 +92,15 @@ class AudioBufferProcessor(FrameProcessor):
         self._output_resampler = create_stream_resampler()
         self._last_user_buffer_update_time: float | None = None
         self._last_bot_buffer_update_time: float | None = None
+        # Wall-clock anchor + per-track cumulative positions (bytes flushed so
+        # far; the live buffer length is added on top). Silence fills are
+        # clamped so a track can never grow past the wall clock — an elapsed
+        # gap that was really late-delivered audio (a network/event-loop
+        # burst) must not be filled AND appended, which inflated recordings
+        # past the call's real duration.
+        self._recording_start_time: float | None = None
+        self._user_flushed_bytes = 0
+        self._bot_flushed_bytes = 0
 
         self._register_event_handler("on_audio_data")
         self._register_event_handler("on_track_audio_data")
@@ -151,6 +160,7 @@ class AudioBufferProcessor(FrameProcessor):
         """
         self._recording = True
         self._reset_recording()
+        self._recording_start_time = time.monotonic()
 
     async def stop_recording(self):
         """Stop recording and trigger final audio data handlers.
@@ -209,7 +219,11 @@ class AudioBufferProcessor(FrameProcessor):
                 # Insert silence for any wall-clock gap since the user buffer was
                 # last written (covers muted microphone and other silent periods).
                 self._fill_buffer_silence_gap(
-                    self._user_audio_buffer, self._last_user_buffer_update_time, now, len(resampled)
+                    self._user_audio_buffer,
+                    self._last_user_buffer_update_time,
+                    now,
+                    len(resampled),
+                    self._user_flushed_bytes,
                 )
                 self._last_user_buffer_update_time = now
                 # Sync bot buffer to current user position before adding user audio.
@@ -246,7 +260,11 @@ class AudioBufferProcessor(FrameProcessor):
                 # last written (covers idle periods between bot utterances, e.g.
                 # while a slow function call runs).
                 self._fill_buffer_silence_gap(
-                    self._bot_audio_buffer, self._last_bot_buffer_update_time, now, len(resampled)
+                    self._bot_audio_buffer,
+                    self._last_bot_buffer_update_time,
+                    now,
+                    len(resampled),
+                    self._bot_flushed_bytes,
                 )
                 self._last_bot_buffer_update_time = now
                 # Sync user buffer to current bot position before adding bot audio.
@@ -296,6 +314,7 @@ class AudioBufferProcessor(FrameProcessor):
         last_update_time: float | None,
         now: float,
         frame_bytes: int,
+        flushed_bytes: int = 0,
     ):
         """Insert silence into a buffer when a wall-clock gap is detected.
 
@@ -305,12 +324,35 @@ class AudioBufferProcessor(FrameProcessor):
         period between bot utterances) is filled with silence so the recorded
         utterances remain temporally separated.
 
+        The fill is clamped so the track's total position (flushed + buffered
+        + fill + incoming frame) never passes the wall clock. An elapsed gap
+        can also be *late-delivered* audio (a network or event-loop burst):
+        filling it and then appending the burst would record the same span
+        twice and inflate the recording past the call's real duration. The
+        clamp caps the fill at true wall position, and because a burst's
+        overshoot lowers the cap of every later fill, overshoot is reclaimed
+        at the next genuine silence instead of accumulating.
+
+        ponytail: the clamp bounds inflation, it does not eliminate it. A
+        gap is only *provably* delivery lag once the backlog arrives, which
+        is after the fill decision, so a burst carrying more real audio than
+        the wall time remaining still overshoots until the next silence
+        reclaims it. Measured on simulated web-carrier delivery: realistic
+        jitter +37% -> +5%, a pathological 2 s instant burst +1.78 s ->
+        +1.48 s. Driving the residual to zero needs positional writes (a
+        write cursor per track so late audio overwrites the silence it was
+        wrongly given) instead of append-only buffers — a bigger change than
+        this bug has earned. ``recording.stopped.drift_ms`` reports what is
+        left, per call.
+
         Args:
             buffer: The audio buffer to pad (user or bot).
             last_update_time: Monotonic time of the last write to this buffer,
                 or None if the buffer has never been written.
             now: Current monotonic time.
             frame_bytes: Byte length of the incoming (resampled) audio frame.
+            flushed_bytes: Bytes of this track already flushed out of the
+                buffer, so the clamp sees the track's absolute position.
         """
         if last_update_time is None or self._sample_rate == 0:
             return
@@ -321,6 +363,11 @@ class AudioBufferProcessor(FrameProcessor):
 
         if gap > 0.2:  # 200 ms threshold — safely above normal jitter
             silence_bytes = int(gap * self._sample_rate * 2)
+            if self._recording_start_time is not None:
+                wall_bytes = int((now - self._recording_start_time) * self._sample_rate * 2)
+                track_position = flushed_bytes + len(buffer)
+                wall_cap = wall_bytes - track_position - frame_bytes
+                silence_bytes = min(silence_bytes, max(0, wall_cap))
             silence_bytes -= silence_bytes % 2  # keep 16-bit alignment
             if silence_bytes > 0:
                 buffer.extend(b"\x00" * silence_bytes)
@@ -389,6 +436,9 @@ class AudioBufferProcessor(FrameProcessor):
         self._reset_all_audio_buffers()
         self._last_user_buffer_update_time = None
         self._last_bot_buffer_update_time = None
+        self._recording_start_time = None
+        self._user_flushed_bytes = 0
+        self._bot_flushed_bytes = 0
 
     def _reset_all_audio_buffers(self):
         """Reset all audio buffers to empty state."""
@@ -397,6 +447,8 @@ class AudioBufferProcessor(FrameProcessor):
 
     def _reset_primary_audio_buffers(self):
         """Clear user and bot buffers while preserving turn buffers and timestamps."""
+        self._user_flushed_bytes += len(self._user_audio_buffer)
+        self._bot_flushed_bytes += len(self._bot_audio_buffer)
         self._user_audio_buffer = bytearray()
         self._bot_audio_buffer = bytearray()
         now = time.monotonic()

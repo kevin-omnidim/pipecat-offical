@@ -390,6 +390,7 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             p._last_user_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
             mock_time.monotonic.return_value = 0.1  # 100 ms later
             await self._send_user_frame(p, audio)
 
@@ -404,6 +405,7 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             p._last_user_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
             mock_time.monotonic.return_value = 1.0  # 1-second gap
             await self._send_user_frame(p, audio)
 
@@ -430,6 +432,7 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
             # Utterance 1 is already in the buffer at t=0.
             mock_time.monotonic.return_value = 0.0
             p._last_user_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
             p._user_audio_buffer.extend(utterance)
 
             # One second later the user unmutes and speaks utterance 2.
@@ -465,6 +468,7 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             # Pin timestamp at t=0 (simulates prior user audio with no frames sent).
             p._last_user_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
 
             # Bot speaks at t=1 → must advance _last_user_buffer_update_time to 1.0.
             mock_time.monotonic.return_value = 1.0
@@ -495,6 +499,7 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             p._last_user_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
             mock_time.monotonic.return_value = 1.0
             await self._send_user_frame(p, audio)
 
@@ -530,6 +535,7 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             mock_time.monotonic.return_value = 5.0
             p._last_user_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
 
             flushed = asyncio.Event()
 
@@ -610,6 +616,7 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             p._last_bot_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
             mock_time.monotonic.return_value = 0.1  # 100 ms later
             await self._send_bot_frame(p, audio)
 
@@ -624,6 +631,7 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             p._last_bot_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
             mock_time.monotonic.return_value = 1.0  # 1-second gap
             await self._send_bot_frame(p, audio)
 
@@ -651,6 +659,7 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
             # Utterance 1 is already in the buffer at t=0.
             mock_time.monotonic.return_value = 0.0
             p._last_bot_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
             p._bot_audio_buffer.extend(utterance)
 
             # One second later the bot speaks utterance 2.
@@ -686,6 +695,7 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             # Pin bot timestamp at t=0 (simulates prior bot audio with no frames sent).
             p._last_bot_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
 
             # User speaks at t=1 → must advance _last_bot_buffer_update_time to 1.0.
             mock_time.monotonic.return_value = 1.0
@@ -725,6 +735,7 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             p._last_bot_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
             mock_time.monotonic.return_value = 1.0
             await self._send_bot_frame(p, audio)
 
@@ -756,6 +767,7 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             mock_time.monotonic.return_value = 5.0
             p._last_bot_buffer_update_time = 0.0
+            p._recording_start_time = 0.0
 
             flushed = asyncio.Event()
 
@@ -769,6 +781,54 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
         # Timestamp should be set to the mocked flush time, not None.
         self.assertIsNotNone(p._last_bot_buffer_update_time)
         self.assertEqual(p._last_bot_buffer_update_time, 5.0)
+        await p.cleanup()
+
+
+class TestBurstDeliveryClamp(unittest.IsolatedAsyncioTestCase):
+    """A late-delivered audio burst must not inflate the recording past wall time.
+
+    When frames stall in flight (network jitter, event-loop stall, browser tab
+    throttling) and then arrive as a burst, the elapsed-based gap fill sees the
+    stall as silence, fills it, and then the burst is appended on top — the
+    same span recorded twice. The wall-clock clamp caps every fill at the true
+    wall position, so a burst's overshoot is reclaimed at the next genuine
+    silence and the track ends exactly on the wall clock (prod: call 6988499,
+    a 78 s web call whose recording came out 90 s long).
+
+    Reclamation is what this asserts, and it is also the limit of the fix: a
+    burst is only *known* to be delivery lag after it lands, so a track can
+    still be over-long between the burst and the next silence. See the
+    ``_fill_buffer_silence_gap`` docstring for the measured residual.
+    """
+
+    _BYTES_PER_SECOND = 16000 * 2
+
+    async def _send(self, processor: AudioBufferProcessor, audio: bytes):
+        await processor.process_frame(
+            InputAudioRawFrame(audio=audio, sample_rate=16000, num_channels=1),
+            FrameDirection.DOWNSTREAM,
+        )
+
+    async def test_burst_overshoot_reclaimed_at_next_silence_fill(self):
+        p = await _make_processor()
+        frame = b"\x01" * 640  # 20 ms @ 16 kHz mono
+
+        with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
+            p._recording_start_time = 0.0
+            p._last_user_buffer_update_time = 0.0
+
+            # A 1-second stall, then the whole backlog arrives as one burst.
+            mock_time.monotonic.return_value = 1.0
+            for _ in range(50):  # 50 × 20 ms = 1 s of late audio
+                await self._send(p, frame)
+
+            # A genuine 2-second mute gap later: the fill must be clamped so
+            # the track lands exactly back on the wall clock.
+            mock_time.monotonic.return_value = 3.0
+            await self._send(p, frame)
+
+        expected_total = int(3.0 * self._BYTES_PER_SECOND)
+        self.assertEqual(len(p._user_audio_buffer), expected_total)
         await p.cleanup()
 
 
