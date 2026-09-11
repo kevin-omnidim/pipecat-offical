@@ -818,6 +818,7 @@ class SarvamTTSService(InterruptibleTTSService):
         sample_rate: int | None = None,
         params: InputParams | None = None,
         settings: Settings | None = None,
+        flush_per_sentence: bool = False,
         **kwargs,
     ):
         """Initialize the Sarvam TTS service with voice and transport configuration.
@@ -856,6 +857,13 @@ class SarvamTTSService(InterruptibleTTSService):
 
             settings: Runtime-updatable settings. When provided alongside deprecated
                 parameters, ``settings`` values take precedence.
+            flush_per_sentence: Send a flush after each synthesized sentence so the
+                server returns one ``final`` event per sentence instead of one per
+                turn. Intermediate finals are routed to an optional
+                ``on_sentence_flushed(context_id, flush_id, audio_offset_bytes)``
+                coroutine (for subclasses/mixins that splice or attribute audio);
+                only the turn-end final closes the audio context. A flush also
+                overrides ``min_buffer_size``, so short sentences separate cleanly.
             **kwargs: Arguments forwarded to InterruptibleTTSService.
 
         See https://docs.sarvam.ai/api-reference-docs/text-to-speech/stream
@@ -983,6 +991,17 @@ class SarvamTTSService(InterruptibleTTSService):
         self._receive_task = None
         self._keepalive_task = None
 
+        # Per-sentence flush state. The pending counter tells sentence finals
+        # apart from the turn-end final (FIFO socket, finals arrive in order).
+        # Wire bytes are counted per context HERE, in the receive loop, because
+        # a final refers to audio that may still be queued in the audio context
+        # and not yet captured downstream; the wire count is the only offset
+        # that is valid whenever it is later applied.
+        self._flush_per_sentence = flush_per_sentence
+        self._pending_sentence_flushes = 0
+        self._sentence_flush_seq = 0
+        self._ctx_wire_bytes: dict[str, int] = {}
+
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
 
@@ -1078,6 +1097,13 @@ class SarvamTTSService(InterruptibleTTSService):
             logger.debug("Connected to Sarvam TTS Websocket")
             await self._send_config()
 
+            # Fresh socket, fresh flush accounting: pending flushes died with
+            # the old connection (barge-in tears the socket down), and a stale
+            # counter would misattribute the next turn's finals.
+            self._pending_sentence_flushes = 0
+            self._sentence_flush_seq = 0
+            self._ctx_wire_bytes.clear()
+
             await self._call_event_handler("on_connected")
         except Exception as e:
             await self.push_error(
@@ -1131,6 +1157,9 @@ class SarvamTTSService(InterruptibleTTSService):
             await self.push_error(error_msg=f"Error closing websocket: {e}", exception=e)
         finally:
             self._websocket = None
+            self._pending_sentence_flushes = 0
+            self._sentence_flush_seq = 0
+            self._ctx_wire_bytes.clear()
             await self._call_event_handler("on_disconnected")
 
     def _get_websocket(self):
@@ -1151,15 +1180,49 @@ class SarvamTTSService(InterruptibleTTSService):
                     # Check for interruption before processing audio
                     await self.stop_ttfb_metrics()
                     audio = base64.b64decode(msg["data"]["audio"])
+                    if self._flush_per_sentence and context_id:
+                        self._ctx_wire_bytes[context_id] = (
+                            self._ctx_wire_bytes.get(context_id, 0) + len(audio)
+                        )
                     frame = TTSAudioRawFrame(audio, self.sample_rate, 1, context_id=context_id)
                     await self.append_to_audio_context(context_id, frame)
                 elif (
                     msg.get("type") == "event" and msg.get("data", {}).get("event_type") == "final"
                 ):
+                    if self._flush_per_sentence and self._pending_sentence_flushes > 0:
+                        # A sentence boundary, not the turn end: one final answers
+                        # each per-sentence flush, in order, and the turn-end
+                        # flush_audio() flush arrives only after all of them.
+                        # Report it to the optional hook and leave the context
+                        # open, or this marker would silence the rest of the turn.
+                        self._pending_sentence_flushes -= 1
+                        self._sentence_flush_seq += 1
+                        logger.trace(
+                            f"TTS sentence final #{self._sentence_flush_seq} for "
+                            f"context_id={context_id}"
+                        )
+                        # Isolated on purpose: this runs inside the websocket
+                        # receive loop, and _receive_task_handler treats any
+                        # escaping exception as a connection failure and
+                        # reconnects, so a listener bug would present as a
+                        # network fault and cost the call its in-flight audio.
+                        handler = getattr(self, "on_sentence_flushed", None)
+                        if handler and context_id:
+                            try:
+                                await handler(
+                                    context_id,
+                                    self._sentence_flush_seq,
+                                    self._ctx_wire_bytes.get(context_id, 0),
+                                )
+                            except Exception as e:  # noqa: BLE001 - see above
+                                logger.warning(f"{self} sentence flush listener failed: {e}")
+                        continue
                     # Synthesis for the active context is complete. Emit the
                     # TTSStoppedFrame immediately so BotStoppedSpeakingFrame tracks
                     # the end of audio, instead of waiting on stop_frame_timeout_s.
                     logger.trace(f"TTS final event for context_id={context_id}")
+                    if context_id:
+                        self._ctx_wire_bytes.pop(context_id, None)
                     if context_id and self.audio_context_available(context_id):
                         await self.append_to_audio_context(
                             context_id, TTSStoppedFrame(context_id=context_id)
@@ -1216,6 +1279,16 @@ class SarvamTTSService(InterruptibleTTSService):
 
             try:
                 await self._send_text(text)
+                if (
+                    self._flush_per_sentence
+                    and self._websocket
+                    and self._websocket.state == State.OPEN
+                ):
+                    # One flush per sentence gives one final per sentence (the
+                    # server scopes final to a flush). Count it before sending:
+                    # if the send fails the reconnect below resets the counter.
+                    self._pending_sentence_flushes += 1
+                    await self._websocket.send(json.dumps({"type": "flush"}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:
                 yield ErrorFrame(error=f"Unknown error occurred: {e}")
