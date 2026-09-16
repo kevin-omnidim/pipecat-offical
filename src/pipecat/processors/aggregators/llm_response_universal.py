@@ -1183,6 +1183,7 @@ class LLMUserAggregator(LLMContextAggregator):
         await self._queued_broadcast_frame(
             VADUserStoppedSpeakingFrame,
             stop_secs=controller._vad_analyzer.params.stop_secs,
+            debounce_secs=controller._vad_analyzer.stop_debounce_secs,
         )
 
     async def _on_vad_speech_activity(self, controller):

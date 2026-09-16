@@ -80,6 +80,7 @@ class VADProcessor(FrameProcessor):
             await self.broadcast_frame(
                 VADUserStoppedSpeakingFrame,
                 stop_secs=_controller._vad_analyzer.params.stop_secs,
+                debounce_secs=_controller._vad_analyzer.stop_debounce_secs,
             )
 
         @self._vad_controller.event_handler("on_speech_activity")

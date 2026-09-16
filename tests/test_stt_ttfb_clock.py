@@ -27,6 +27,7 @@ import time
 import pytest
 
 from pipecat.frames.frames import (
+    InterruptionFrame,
     MetricsFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
@@ -287,3 +288,309 @@ async def test_two_clean_utterances_report_two_fresh_ttfbs():
 
     values = _ttfb_values(received)
     assert len(values) == 2, f"expected 2 TTFB reports, got {values}"
+
+
+#
+# An interruption is not a transcript. It reaches the STT on every user turn
+# start and on any component that cuts the bot off, so neither stopping the
+# armed clock (it reports "speech end -> whatever interrupted") nor cancelling
+# it (the utterance's real final then reports nothing) is a measurement. The
+# clock is left alone; a VAD start disarms it and the no-show window bounds it.
+#
+
+
+@pytest.mark.asyncio
+async def test_interruption_leaves_the_armed_clock_for_the_real_final():
+    # Window far larger than the test: only a transcript can end the clock.
+    stt = _ClockProbeSTT(stt_ttfb_timeout=5.0, ttfs_p99_latency=0.1)
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            VADUserStoppedSpeakingFrame(stop_secs=0.05),
+            SleepFrame(0.1),
+            InterruptionFrame(),
+            SleepFrame(0.1),
+            _final("the utterance's real transcript"),
+        ],
+    )
+
+    values = _ttfb_values(received)
+    assert len(values) == 1, f"the final after an interruption must report, got {values}"
+    # Measured to the final (~0.2 s after arming), not to the interruption.
+    assert 0.15 < values[0] < 1.0, values
+
+
+@pytest.mark.asyncio
+async def test_interruption_with_no_transcript_reports_nothing():
+    stt = _ClockProbeSTT(stt_ttfb_timeout=0.2, ttfs_p99_latency=0.1)
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            VADUserStoppedSpeakingFrame(stop_secs=0.05),
+            SleepFrame(0.05),
+            InterruptionFrame(),
+            # Let the no-show window expire with no transcript at all.
+            SleepFrame(0.5),
+        ],
+    )
+
+    assert _ttfb_values(received) == []
+
+
+#
+# A final that lands BEFORE the VAD stop (Soniox's server endpoint beats our
+# 0.6–1.0 s silence debounce on most turns) is that utterance's transcript.
+# The stop must report speech-end → that final at once, not arm a clock that
+# no later transcript will stop.
+#
+
+
+@pytest.mark.asyncio
+async def test_final_before_vad_stop_is_reported_at_the_stop():
+    # Window far larger than the test: a report inside it can only come from
+    # the stop handler itself, never from the no-show reporter.
+    stt = _ClockProbeSTT(stt_ttfb_timeout=5.0, ttfs_p99_latency=0.1)
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            SleepFrame(0.1),
+            _final("i cannot buy your flat"),
+            # VAD declares the stop 0.1 s later, after 0.3 s of debounce: the
+            # speech end it implies (stop − 0.3) is 0.2 s BEFORE the final.
+            SleepFrame(0.1),
+            VADUserStoppedSpeakingFrame(stop_secs=0.3),
+            SleepFrame(0.1),
+        ],
+    )
+
+    values = _ttfb_values(received)
+    # One report, and it arrived inside a 5 s window that never expired: only
+    # the stop handler can have produced it. Frames carry construction-time
+    # timestamps while the final's arrival is measured when it is processed,
+    # so the value is "test wall time so far", not a fixed 0.2 s — pin the
+    # magnitude only.
+    assert len(values) == 1, f"expected the final to be reported once, got {values}"
+    assert 0 < values[0] < 1.0, values
+
+
+#
+# The mirror case: a final that lands BEFORE the utterance's speech end (an
+# endpoint fired during a pause, then silence) is not this stop's transcript.
+# The no-show reporter must discard the clock, not report a negative TTFB.
+#
+
+
+def _all_ttfb_values(frames):
+    return [
+        data.value
+        for frame in frames
+        if isinstance(frame, MetricsFrame)
+        for data in frame.data
+        if isinstance(data, TTFBMetricsData)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_expiry_with_only_a_final_older_than_speech_end_reports_nothing():
+    stt = _ClockProbeSTT(stt_ttfb_timeout=0.2, ttfs_p99_latency=0.1)
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            _final("hello"),
+            # VAD frames are system frames and overtake queued data frames in
+            # the harness; let the final land first, as it does in production
+            # where the STT pushes its own transcripts inline.
+            SleepFrame(0.05),
+            # A stop whose implied speech end (timestamp − stop_secs) is far
+            # AFTER that final: the final cannot belong to this speech end.
+            VADUserStoppedSpeakingFrame(stop_secs=0.05, timestamp=time.time() + 30.0),
+            # Let the no-show window expire.
+            SleepFrame(0.4),
+        ],
+    )
+
+    negatives = [v for v in _all_ttfb_values(received) if v < 0]
+    assert negatives == [], f"a transcript older than speech end is not a TTFB: {negatives}"
+    assert _ttfb_values(received) == []
+
+
+#
+# Speech end comes from the silence the VAD really counted. A runtime debounce
+# change (our Adaptive Silence) moves the counter but leaves the reported
+# ``stop_secs`` alone, so a clock started from ``stop_secs`` under-measures by
+# the whole extra debounce (prod 2026-09-16: 400–800 ms low on bumped turns).
+#
+
+
+@pytest.mark.asyncio
+async def test_speech_end_uses_the_counted_debounce_when_the_frame_carries_it():
+    stt = _ClockProbeSTT(stt_ttfb_timeout=5.0, ttfs_p99_latency=0.1)
+    now = time.time()
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            # Reported 0.05 s, but 0.65 s of silence was actually counted, so
+            # speech ended 0.65 s before the stop. The final lands right at the
+            # stop (an explicit timestamp keeps the arithmetic exact).
+            VADUserStoppedSpeakingFrame(stop_secs=0.05, debounce_secs=0.65, timestamp=now),
+            _final("bumped turn"),
+        ],
+    )
+
+    values = _ttfb_values(received)
+    assert len(values) == 1, values
+    # From stop_secs alone this would read ~0.05 s + processing; from the
+    # counted debounce it is ~0.65 s + processing.
+    assert values[0] > 0.6, values
+
+
+@pytest.mark.asyncio
+async def test_speech_end_falls_back_to_stop_secs_when_debounce_is_unknown():
+    stt = _ClockProbeSTT(stt_ttfb_timeout=5.0, ttfs_p99_latency=0.1)
+    now = time.time()
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            # A producer that does not know the counted debounce leaves it 0.
+            VADUserStoppedSpeakingFrame(stop_secs=0.05, timestamp=now),
+            _final("plain turn"),
+        ],
+    )
+
+    values = _ttfb_values(received)
+    assert len(values) == 1, values
+    assert values[0] < 0.6, values
+
+
+#
+# A counted debounce of zero is a measurement, not a missing value: an
+# analyzer whose own silence hold lives below pipecat (the AIC VAD) counts no
+# stop frames, so its speech end IS the stop timestamp.
+#
+
+
+@pytest.mark.asyncio
+async def test_a_counted_zero_debounce_arms_the_clock_and_measures_from_the_stop():
+    stt = _ClockProbeSTT(stt_ttfb_timeout=5.0, ttfs_p99_latency=0.1)
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            # Reported stop_secs is 0.0 too, so only the counted value can arm this.
+            VADUserStoppedSpeakingFrame(stop_secs=0.0, debounce_secs=0.0, timestamp=time.time()),
+            _final("counted zero"),
+        ],
+    )
+
+    values = _ttfb_values(received)
+    assert len(values) == 1, f"a counted zero must still be measured, got {values}"
+    assert values[0] < 0.5, values
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_debounce_with_no_reported_stop_secs_does_not_arm():
+    stt = _ClockProbeSTT(stt_ttfb_timeout=0.2, ttfs_p99_latency=0.1)
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            # A producer that reports neither value places no speech end.
+            VADUserStoppedSpeakingFrame(stop_secs=0.0),
+            _final("nothing to measure from"),
+            SleepFrame(0.4),
+        ],
+    )
+
+    assert _ttfb_values(received) == []
+
+
+#
+# One utterance, one clock: a second stop with no start between re-arms, and a
+# final already reported belongs to no later stop.
+#
+
+
+@pytest.mark.asyncio
+async def test_a_second_stop_without_a_start_takes_over_the_earlier_stop_s_timer():
+    # Window = max(0.2, 0.1 * 1.5) = 0.2 s. The final lands past the FIRST
+    # stop's window and inside the second's, so it survives only if the first
+    # stop's timer no longer owns the clock.
+    stt = _ClockProbeSTT(stt_ttfb_timeout=0.2, ttfs_p99_latency=0.1)
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            VADUserStoppedSpeakingFrame(stop_secs=0.05),
+            SleepFrame(0.15),
+            VADUserStoppedSpeakingFrame(stop_secs=0.05),
+            SleepFrame(0.15),
+            _final("late but inside the second window"),
+        ],
+    )
+
+    values = _ttfb_values(received)
+    assert len(values) == 1, f"the second stop's clock must survive, got {values}"
+
+
+@pytest.mark.asyncio
+async def test_a_final_already_reported_is_not_reported_again_by_a_later_stop():
+    stt = _ClockProbeSTT(stt_ttfb_timeout=5.0, ttfs_p99_latency=0.1)
+    now = time.time()
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            _final("only utterance"),
+            SleepFrame(0.05),
+            # Reports the final above.
+            VADUserStoppedSpeakingFrame(stop_secs=0.3, timestamp=now),
+            SleepFrame(0.05),
+            # A later stop whose debounce window still spans that final.
+            VADUserStoppedSpeakingFrame(stop_secs=0.5, timestamp=now + 0.1),
+            SleepFrame(0.1),
+        ],
+    )
+
+    values = _ttfb_values(received)
+    assert len(values) == 1, f"a consumed final is not a second measurement: {values}"
+
+
+@pytest.mark.asyncio
+async def test_a_final_that_closed_a_clock_is_not_reported_again_by_a_later_stop():
+    # The final closes the measurement armed by the first stop. A second stop
+    # with no speech start between must not find it still spendable.
+    stt = _ClockProbeSTT(stt_ttfb_timeout=5.0, ttfs_p99_latency=0.1)
+    now = time.time()
+
+    received = await _run_stt_test(
+        stt,
+        [
+            VADUserStartedSpeakingFrame(),
+            VADUserStoppedSpeakingFrame(stop_secs=0.2, timestamp=now),
+            SleepFrame(0.05),
+            _final("closes the first stop's clock"),
+            SleepFrame(0.05),
+            # Its debounce window reaches back past that final.
+            VADUserStoppedSpeakingFrame(stop_secs=1.0, timestamp=now + 0.2),
+            SleepFrame(0.1),
+        ],
+    )
+
+    values = _ttfb_values(received)
+    assert len(values) == 1, f"the final closed one measurement, not two: {values}"

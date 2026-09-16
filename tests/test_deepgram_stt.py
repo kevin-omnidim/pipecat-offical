@@ -312,3 +312,60 @@ async def test_final_transcript_emits_usage_before_transcription_frame(monkeypat
     assert isinstance(data, STTUsageMetricsData)
     assert data.value.audio_seconds == 1.25
     assert service._stt_usage_pending_seconds == 0.0
+
+
+#
+# STT TTFB: the finalize acknowledgement is not the transcript.
+#
+
+
+@pytest.mark.asyncio
+async def test_finalize_ack_measures_to_the_transcript_not_to_the_ack():
+    """An empty is_final sent from a Finalize acknowledges a transcript that
+    already arrived, so the TTFB it reports is that transcript's wait, not the
+    round trip to the acknowledgement."""
+    import time
+    from types import SimpleNamespace
+
+    from pipecat.frames.frames import MetricsFrame
+    from pipecat.metrics.metrics import TTFBMetricsData
+    from pipecat.processors.metrics.frame_processor_metrics import FrameProcessorMetrics
+    from pipecat.services.deepgram.stt import ListenV1Results
+
+    service = _make_bare_service()
+    service._metrics = FrameProcessorMetrics()
+    service._metrics.set_processor_name("DeepgramSTTService#0")
+    service._report_only_initial_ttfb = False
+    service.can_generate_metrics = lambda: True
+    service._ttfb_timeout_task = None
+    service._stt_ttfb_armed_at = 0
+    service._finalize_requested = True
+    service._finalize_pending = False
+    service._enable_metrics = True
+    service._enable_usage_metrics = False
+
+    speech_end = time.time() - 1.0
+    service._last_transcript_time = speech_end + 0.3
+    await service._metrics.start_ttfb_metrics(start_time=speech_end, report_only_initial_ttfb=False)
+
+    pushed = []
+    service.push_frame = AsyncMock(side_effect=lambda frame, *a, **k: pushed.append(frame))
+
+    ack = ListenV1Results.model_construct(is_final=True, from_finalize=True)
+    object.__setattr__(
+        ack,
+        "channel",
+        SimpleNamespace(alternatives=[SimpleNamespace(transcript="", languages=None)]),
+    )
+    await service._on_message(ack)
+
+    values = [
+        data.value
+        for frame in pushed
+        if isinstance(frame, MetricsFrame)
+        for data in frame.data
+        if isinstance(data, TTFBMetricsData)
+    ]
+    assert len(values) == 1, f"the ack must report the already-arrived transcript: {pushed}"
+    # 0.3 s of STT latency, not the ~1.0 s elapsed since speech end.
+    assert values[0] == pytest.approx(0.3, abs=0.05), values

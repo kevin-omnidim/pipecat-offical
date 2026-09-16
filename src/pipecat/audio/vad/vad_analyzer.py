@@ -116,6 +116,26 @@ class VADAnalyzer(ABC):
         """
         return self._params
 
+    @property
+    def stop_debounce_secs(self) -> float:
+        """Silence this analyzer counts before it declares a stop.
+
+        ``params.stop_secs`` is the *reported* value and ``_vad_stop_frames``
+        is what debounces; the two may be moved independently at runtime, so a
+        consumer that needs the real end of speech reads this one.
+
+        Returns:
+            Counted silence in seconds. 0.0 is a measurement, not a missing
+            value: an analyzer holding speech below pipecat counts no stop
+            frames, and one without a sample rate yet has produced no stop to
+            measure from either.
+        """
+        frames = getattr(self, "_vad_frames", 0)
+        stop_frames = getattr(self, "_vad_stop_frames", 0)
+        if not self._sample_rate or not frames:
+            return 0.0
+        return stop_frames * frames / self._sample_rate
+
     @abstractmethod
     def num_frames_required(self) -> int:
         """Get the number of audio frames required for analysis.
