@@ -168,6 +168,9 @@ class STTService(AIService):
         self._finalize_pending: bool = False
         self._finalize_requested: bool = False
         self._last_transcript_time: float = 0
+        self._last_finalized_transcript_time: float = 0
+        # Speech end the armed clock measures from (0 while disarmed).
+        self._stt_ttfb_armed_at: float = 0
 
         # Keepalive state
         self._keepalive_timeout = keepalive_timeout
@@ -376,6 +379,37 @@ class STTService(AIService):
         await self._cancel_keepalive_task()
         self._reconnect_audio_buffer.clear()
 
+    async def stop_all_metrics(self):
+        """Stop every metric except the TTFB clock.
+
+        For an STT this runs on ``InterruptionFrame``, which reaches the
+        service on every user turn start and from anything that cuts the bot
+        off. An STT TTFB is armed at user speech end and closes only on a
+        transcript of that utterance, so an interruption is neither an endpoint
+        for it nor grounds to discard it: the clock stays armed for the final
+        still to come. A VAD speech start disarms it and
+        :attr:`stt_ttfb_no_show_window` bounds its life.
+        """
+        await self.stop_processing_metrics()
+        await self.stop_text_aggregation_metrics()
+
+    async def stop_ttfb_metrics(self, *, end_time: float | None = None):
+        """Close the armed TTFB measurement, unless the output predates it.
+
+        A transcript older than the speech end being measured belongs to an
+        earlier segment the service finalized on its own endpointing, and the
+        interval to it is negative. Every reporter reaches the clock through
+        here, so the check lives here rather than at each of them.
+
+        Args:
+            end_time: Optional timestamp to use as the end time. If None, uses
+                the current time.
+        """
+        if end_time is not None and end_time < self._stt_ttfb_armed_at:
+            return
+        await super().stop_ttfb_metrics(end_time=end_time)
+        self._stt_ttfb_armed_at = 0
+
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
         """Apply an STT settings delta.
 
@@ -498,7 +532,9 @@ class STTService(AIService):
             self._muted = frame.mute
             logger.debug(f"STT service {'muted' if frame.mute else 'unmuted'}")
         elif isinstance(frame, InterruptionFrame):
-            await self._reset_stt_ttfb_state()
+            # Deliberately no TTFB state change: an interruption says nothing
+            # about the transcript the armed clock is waiting for. See
+            # :meth:`stop_all_metrics`.
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMContextAssistantTurnFrame):
             await self._process_assistant_turn(frame.text)
@@ -529,6 +565,12 @@ class STTService(AIService):
 
             # If this is a finalized transcription, report TTFB immediately
             if frame.finalized:
+                # A final is spendable by a stop still to come only while no
+                # measurement is open. When one is open this final closes it
+                # below, and a later stop must not close a second one with it.
+                self._last_finalized_transcript_time = (
+                    0.0 if self._stt_ttfb_armed_at else self._last_transcript_time
+                )
                 await self.stop_ttfb_metrics()
                 # Cancel the timeout since we've already reported
                 await self._cancel_ttfb_timeout()
@@ -586,19 +628,17 @@ class STTService(AIService):
     async def _reset_stt_ttfb_state(self):
         """Reset STT TTFB measurement state.
 
-        Called when starting a new utterance or on interruption to ensure
-        we don't use stale state for TTFB calculations. This specifically guards
-        against the case where a TranscriptionFrame is received without corresponding
+        Called when a new utterance starts, so no state from the previous one
+        can reach this one's measurement. This specifically guards against the
+        case where a TranscriptionFrame is received without corresponding
         VADUserStartedSpeakingFrame and VADUserStoppedSpeakingFrame frames.
-
-        Note: Does not reset _user_speaking since InterruptionFrame can arrive
-        while user is still speaking.
         """
         await self._cancel_ttfb_timeout()
         # Disarm any leftover TTFB clock as well: a measurement armed by a
         # previous utterance must never be stopped by a later utterance's
         # transcript (that misread produces multi-second phantom TTFBs).
         await self.cancel_ttfb_metrics()
+        self._stt_ttfb_armed_at = 0
 
     async def _handle_vad_user_started_speaking(self, frame: VADUserStartedSpeakingFrame):
         """Handle VAD user started speaking frame to start tracking transcriptions.
@@ -615,6 +655,7 @@ class STTService(AIService):
         self._finalize_requested = False
         self._finalize_pending = False
         self._last_transcript_time = 0
+        self._last_finalized_transcript_time = 0
 
     async def _maybe_reconnect_on_user_stopped_speaking(self):
         """Check if reconnection is needed after the user stops speaking.
@@ -641,18 +682,39 @@ class STTService(AIService):
         """
         self._user_speaking = False
 
-        # Skip TTFB measurement if stop_secs is not set
-        if frame.stop_secs == 0.0:
+        # Without a debounce there is no speech end to measure from. A counted
+        # 0.0 is one (the stop timestamp itself); only an unreported one, with
+        # nothing to fall back to, leaves the utterance unmeasurable.
+        if frame.debounce_secs is None and frame.stop_secs == 0.0:
             return
 
-        # Calculate the actual speech end time (current time minus VAD stop delay).
-        # This approximates when the last user audio was sent to the STT service,
-        # which we use to measure against the eventual transcription response.
-        speech_end_time = frame.timestamp - frame.stop_secs
+        # Speech ended one debounce before this frame: that approximates when
+        # the last user audio reached the service, which the eventual
+        # transcript is measured against. The debounce the analyzer counted is
+        # the one to subtract whenever the producer reports it, because the
+        # reported stop_secs may be held below it on purpose (turn-stop
+        # strategies subtract stop_secs from the STT finalize window).
+        debounce = frame.debounce_secs if frame.debounce_secs is not None else frame.stop_secs
+        speech_end_time = frame.timestamp - debounce
+
+        # One clock per service: a stop with no speech start before it re-arms
+        # this utterance, so an earlier stop's reporter must not outlive it and
+        # close the new measurement against the old speech end.
+        await self._cancel_ttfb_timeout()
+        self._stt_ttfb_armed_at = speech_end_time
         await self.start_ttfb_metrics(start_time=speech_end_time)
 
-        # Start timeout task (any previous timeout was cancelled by VADUserStartedSpeakingFrame
-        # or InterruptionFrame)
+        if self._last_finalized_transcript_time >= speech_end_time:
+            # This utterance's final already arrived, as it does whenever a
+            # server-side endpoint resolves before the VAD debounce elapses.
+            # It is consumed here so no later stop can report it a second time.
+            already_arrived = self._last_finalized_transcript_time
+            self._last_finalized_transcript_time = 0
+            await self.stop_ttfb_metrics(end_time=already_arrived)
+            return
+
+        # Start timeout task (any previous timeout was cancelled above or by
+        # VADUserStartedSpeakingFrame)
         self._ttfb_timeout_task = self.create_task(
             self._ttfb_timeout_handler(), name="stt_ttfb_timeout"
         )
@@ -669,7 +731,10 @@ class STTService(AIService):
         """
         try:
             await asyncio.sleep(self.stt_ttfb_no_show_window)
-            if self._last_transcript_time > 0:
+            # A transcript is this utterance's only if it arrived at or after
+            # the speech end the clock measures from; an older one belongs to
+            # an earlier pause and would report a negative interval.
+            if self._last_transcript_time and self._last_transcript_time >= self._stt_ttfb_armed_at:
                 await self.stop_ttfb_metrics(end_time=self._last_transcript_time)
             else:
                 await self.cancel_ttfb_metrics()

@@ -1122,11 +1122,18 @@ class VADUserStoppedSpeakingFrame(SystemFrame):
         stop_secs: The VAD stop_secs duration that was used to confirm the user
             stopped speaking. This represents the silence duration that had to
             elapse before the VAD determined speech ended.
+        debounce_secs: The silence the analyzer counted before this stop
+            (``VADAnalyzer.stop_debounce_secs``), which equals ``stop_secs``
+            unless the debounce moved at runtime without the reported value.
+            ``None`` when the producer does not know it, and the only case in
+            which a consumer falls back to ``stop_secs``.
         timestamp: Wall-clock time when the VAD made its determination.
     """
 
     stop_secs: float = 0.0
     timestamp: float = field(default_factory=time.time)
+    # Declared last: field order is this frame's positional signature.
+    debounce_secs: float | None = None
 
 
 @dataclass
